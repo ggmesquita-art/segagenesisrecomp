@@ -14,6 +14,7 @@
  */
 #include "m68k_interp.h"
 #include "m68k_decoder.h"   /* recompiler/src — added to the runner include path */
+#include "m68k_timing.h"    /* m68k_68000_nominal_cycles — shared with codegen  */
 #include "rom_parser.h"     /* GenesisRom, rom_read* (decoder's fetch source)    */
 #ifdef GENESIS_COSIM
 #include "game_cycles.h"    /* game_insn_cost — clown-measured baked costs        */
@@ -1136,163 +1137,14 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
  * floor run. Mirroring the generated accounting makes a floored function behave
  * identically to its statically-recompiled twin (parity-by-construction).
  *
- * N is the PRM structural estimate — a verbatim port of code_generator.c's
- * estimate_cycles_prm(). The recompiler bakes clown-measured literals into the
- * generated C when its cycle_probe is available, but that probe links clown
- * (AGPL, dev-only) and is irrelevant here: the floor only needs the accumulator
- * to advance at a realistic rate so VBlank is serviced at the right cadence, and
- * estimate_cycles_prm() is exactly the fallback the recompiler itself uses.
+ * N is m68k_68000_nominal_cycles() — the same shared timing model that
+ * code_generator.c's estimate_cycles_prm() uses. The recompiler bakes those
+ * cycle literals into generated C (and cosim builds can consult game_insn_cost
+ * first), so calling m68k_68000_nominal_cycles() guarantees identical pacing
+ * between recompiled and interpreted execution.
  * Gated on ENABLE_RECOMPILED_CODE so the standalone differential harness (which
  * does not link glue.c) needs none of these symbols.
  * ========================================================================= */
-
-static int interp_popcount16(uint16_t v) {
-    int c = 0;
-    while (v) { c += v & 1; v >>= 1; }
-    return c;
-}
-
-/* PRM Table B-1 EA fetch cost (longword adds one memory round-trip). */
-static int interp_ea_read_cost(int ea, M68KSize sz) {
-    int is_long = (sz == M68K_SIZE_L);
-    int mode    = (ea >> 3) & 7;
-    int reg     =  ea       & 7;
-    switch (mode) {
-    case 0: return 0;                              /* Dn        */
-    case 1: return 0;                              /* An        */
-    case 2: return is_long ? 8  : 4;               /* (An)      */
-    case 3: return is_long ? 8  : 4;               /* (An)+     */
-    case 4: return is_long ? 10 : 6;               /* -(An)     */
-    case 5: return is_long ? 12 : 8;               /* d16(An)   */
-    case 6: return is_long ? 14 : 10;              /* d8(An,Xn) */
-    case 7:
-        switch (reg) {
-        case 0: return is_long ? 12 : 8;           /* (xxx).W   */
-        case 1: return is_long ? 16 : 12;          /* (xxx).L   */
-        case 2: return is_long ? 12 : 8;           /* d16(PC)   */
-        case 3: return is_long ? 14 : 10;          /* d8(PC,Xn) */
-        case 4: return is_long ? 8  : 4;           /* #imm      */
-        }
-    }
-    return 0;
-}
-static int interp_ea_write_cost(int ea, M68KSize sz) { return interp_ea_read_cost(ea, sz); }
-
-/* Verbatim port of code_generator.c estimate_cycles_prm(). */
-static int interp_estimate_cycles(const M68KInstr *instr) {
-    M68KSize sz      = instr->size;
-    int      is_long = (sz == M68K_SIZE_L);
-    int      ea_src  = interp_ea_read_cost (instr->src_ea, sz);
-    int      ea_dst  = interp_ea_write_cost(instr->dst_ea, sz);
-    int      dst_mode = (instr->dst_ea >> 3) & 7;
-    int      dst_is_reg = (dst_mode <= 1);
-
-    switch (instr->mnemonic) {
-    case MN_NOP:   return 4;
-    case MN_RTS:   return 16;
-    case MN_RTE:   return 20;
-    case MN_STOP:  return 4;
-    case MN_JSR:   return 18 + ea_src;
-    case MN_BSR:   return 18;
-    case MN_JMP:   return 10 + ea_src;
-    case MN_BRA:   return 10;
-    case MN_Bcc:   return 10;
-    case MN_DBcc:  return 12;
-
-    case MN_MOVE:  return 4 + ea_src + ea_dst;
-    case MN_MOVEA: return 4 + ea_src;
-    case MN_MOVEQ: return 4;
-    case MN_LEA:   return ea_src ? ea_src : 4;
-    case MN_PEA:   return 12 + ea_src;
-
-    case MN_MOVEM: {
-        int nregs = (instr->word_count >= 2) ? interp_popcount16(instr->words[1]) : 4;
-        return (is_long ? 12 + 8*nregs : 8 + 4*nregs) + ea_src;
-    }
-
-    case MN_ADD: case MN_SUB: case MN_AND: case MN_OR:
-    case MN_EOR: case MN_CMP:
-        if (dst_is_reg) return (is_long ? 6 : 4) + ea_src;
-        else            return (is_long ? 12 : 8) + ea_src + ea_dst;
-
-    case MN_ADDA: case MN_SUBA: case MN_CMPA:
-        return (is_long ? 6 : 8) + ea_src;
-
-    case MN_ADDQ: case MN_SUBQ:
-        if (dst_is_reg) return is_long ? 8 : 4;
-        else            return (is_long ? 12 : 8) + ea_dst;
-
-    case MN_ADDX: case MN_SUBX:
-        return is_long ? 8 : 4;
-
-    case MN_ADDI: case MN_SUBI: case MN_ANDI: case MN_ORI:
-    case MN_EORI:
-        if (dst_is_reg) return is_long ? 16 : 8;
-        else            return (is_long ? 20 : 12) + ea_dst;
-
-    case MN_CMPI:
-        if (dst_is_reg) return is_long ? 14 : 8;
-        else            return (is_long ? 12 : 8) + ea_dst;
-
-    case MN_LSL: case MN_LSR:
-    case MN_ASL: case MN_ASR:
-    case MN_ROL: case MN_ROR:
-    case MN_ROXL: case MN_ROXR: {
-        if (!dst_is_reg) return 8 + ea_dst;
-        uint16_t w0 = instr->words[0];
-        int reg_count_mode = (w0 >> 5) & 1;
-        int n;
-        if (reg_count_mode) { n = 4; }
-        else { n = (w0 >> 9) & 7; if (n == 0) n = 8; }
-        return (is_long ? 8 : 6) + 2 * n;
-    }
-
-    case MN_MULS: return 70;
-    case MN_MULU: return 70;
-    case MN_DIVS: return 150;
-    case MN_DIVU: return 140;
-
-    case MN_TST:
-    case MN_CLR:
-    case MN_NEG: case MN_NEGX: case MN_NOT:
-        if (dst_is_reg) return is_long ? 6 : 4;
-        else            return (is_long ? 12 : 8) + ea_dst;
-
-    case MN_NBCD: return dst_is_reg ? 6  : 8  + ea_dst;
-    case MN_TAS:  return dst_is_reg ? 4  : 14 + ea_dst;
-
-    case MN_EXT:  return 4;
-    case MN_SWAP: return 4;
-
-    case MN_BTST: return dst_is_reg ? 6 : (4 + ea_dst);
-    case MN_BCHG: case MN_BCLR: return dst_is_reg ? 8 : (8 + ea_dst);
-    case MN_BSET: return dst_is_reg ? 8 : (8 + ea_dst);
-
-    case MN_LINK: return 16;
-    case MN_UNLK: return 12;
-
-    case MN_Scc:  return dst_is_reg ? 6 : (8 + ea_dst);
-
-    case MN_TRAP:    return 34;
-    case MN_TRAPV:   return 4;
-    case MN_CHK:     return 10 + ea_src;
-    case MN_RTR:     return 20;
-    case MN_RESET:   return 132;
-    case MN_ILLEGAL: return 34;
-
-    case MN_ABCD: case MN_SBCD: return 6;
-
-    case MN_EXG:       return 6;
-    case MN_MOVE_USP:  return 4;
-    case MN_MOVE_SR:   return dst_is_reg ? 6 : (8 + ea_dst);
-    case MN_MOVE_CCR:  return 12 + ea_src;
-    case MN_MOVEP:     return is_long ? 24 : 16;
-
-    case MN_OTHER:
-    default:
-        return 4 + ea_src + ea_dst;
-    }
-}
 
 /* The emit_cycle_accounting() tail, executed after one interpreted instruction. */
 static void interp_account_cycles(const M68KInstr *ins) {
@@ -1305,7 +1157,7 @@ static void interp_account_cycles(const M68KInstr *ins) {
      * shipping floor is a validated pacing change (see game_cycles.h). */
     cyc = game_insn_cost(ins->addr);
 #endif
-    if (cyc < 0) cyc = interp_estimate_cycles(ins);
+    if (cyc < 0) cyc = (int)m68k_68000_nominal_cycles(ins);
     if (cyc < 0) cyc = 4;                          /* never stall the clock */
     g_native_insn_count++;
     g_cycle_accumulator   += (uint32_t)cyc;

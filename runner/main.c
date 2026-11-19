@@ -2672,6 +2672,10 @@ int main(int argc, char *argv[])
             }
             custom_video_cli = argv[++i];
             s_custom_video_cli = custom_video_cli;
+        } else if (argv[i][0] == '-' && g_game_spec.handle_arg) {
+            const char *val = (i + 1 < argc) ? argv[i + 1] : NULL;
+            int consumed = g_game_spec.handle_arg(argv[i], val);
+            if (consumed >= 2 && i + 1 < argc) i++;
         } else if (argv[i][0] != '-') {
             rom_path = argv[i];
         }
@@ -3108,7 +3112,12 @@ int main(int argc, char *argv[])
     Uint32 renderer_flags = SDL_RENDERER_ACCELERATED;
     if (!benchmark_frames && !runtime_uncapped)
         renderer_flags |= SDL_RENDERER_PRESENTVSYNC;
-    SDL_Renderer *renderer = genesis_hd_create_renderer(window,renderer_flags,s_hd_scale);
+    unsigned prefer_gl_scale = s_hd_scale;
+    if (prefer_gl_scale <= 1 && g_game_spec.video &&
+        g_game_spec.video->present_gpu_enabled &&
+        g_game_spec.video->present_gpu_enabled())
+        prefer_gl_scale = 4u;
+    SDL_Renderer *renderer = genesis_hd_create_renderer(window, renderer_flags, prefer_gl_scale);
     if (!renderer) {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     }
@@ -3224,6 +3233,7 @@ int main(int argc, char *argv[])
      * The own backend has no clownmdemu instance â€” glue keeps s_emu NULL and
      * routes everything through g_machine. */
     glue_init(rom_raw, rom_raw_len);
+    if (g_game_spec.on_post_reset) g_game_spec.on_post_reset();
     gvdp_hd_enable(s_hd_requested);
 
     /* Audio arch overhaul: initialise our cycle-stamped YM2612 + PSG
@@ -3611,6 +3621,8 @@ session_begin:;
         while (window_poll_event(&ev)) {
             if(ev.type==SDL_RENDER_TARGETS_RESET||ev.type==SDL_RENDER_DEVICE_RESET) {
                 genesis_hd_gpu_destroy(hd_gpu);hd_gpu=NULL;hd_checked=0;
+                if (g_game_spec.video && g_game_spec.video->present_gpu_destroy)
+                    g_game_spec.video->present_gpu_destroy();
                 SDL_DestroyTexture(s_load_hold_texture);s_load_hold_texture=NULL;
             }
             load_hold_event(&ev, window);
@@ -4114,6 +4126,8 @@ session_begin:;
                 (void)genesis_persist_destroy(s_sram_writer);s_sram_writer=NULL;
                 audio_wav_stop();
                 if(!genesis_host_stream_flush_all())fprintf(stderr,"[capture] final write failed\n");
+                if (g_game_spec.video && g_game_spec.video->present_gpu_destroy)
+                    g_game_spec.video->present_gpu_destroy();
                 genesis_replay_shutdown();
                 return input_script_exit_code();
             }
@@ -4243,6 +4257,20 @@ session_begin:;
                 if(enhanced){SDL_SetTextureScaleMode(enhanced,s_frame_texture_filtered?SDL_ScaleModeLinear:SDL_ScaleModeNearest);
                     frame_texture=enhanced;SDL_QueryTexture(enhanced,NULL,NULL,&src.w,&src.h);src.x=src.y=0;}
             }gvdp_hd_release(job);}
+        }
+        if (!ui_open && !netplay_peer_view_active() &&
+            g_game_spec.video && g_game_spec.video->present_gpu &&
+            g_game_spec.video->present_gpu_enabled &&
+            g_game_spec.video->present_gpu_enabled()) {
+            SDL_Texture *neural = g_game_spec.video->present_gpu(
+                renderer, texture, present_src,
+                s_screen_width, s_screen_height, MAX_SCREEN_WIDTH, NULL);
+            if (neural) {
+                SDL_SetTextureScaleMode(neural, s_frame_texture_filtered ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+                frame_texture = neural;
+                SDL_QueryTexture(neural, NULL, NULL, &src.w, &src.h);
+                src.x = src.y = 0;
+            }
         }
         if(frame_texture==texture) {
             static int peer_view_was_active = 0;
@@ -4615,6 +4643,8 @@ session_begin:;
     audio_close();
     shadow_worker_cleanup();
     genesis_hd_gpu_destroy(hd_gpu);
+    if (g_game_spec.video && g_game_spec.video->present_gpu_destroy)
+        g_game_spec.video->present_gpu_destroy();
     cancel_load_hold();
     SDL_DestroyTexture(s_load_hold_texture);s_load_hold_texture=NULL;
     SDL_DestroyTexture(peer_view_texture);

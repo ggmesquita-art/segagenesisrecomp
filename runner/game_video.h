@@ -5,6 +5,9 @@
 
 struct GVDP;
 struct GVDPRasterRow;
+struct GVDPRasterFrame;
+struct SDL_Renderer;
+struct SDL_Texture;
 /* Synchronous, memoized original image for the current row. Valid only during
  * scanline_lazy; callers that fully draw the row need not request it. */
 typedef const uint32_t *(*GameVideoNativeRow)(void *ctx);
@@ -76,6 +79,15 @@ typedef struct GameVideo {
      * Never enters disk states, deterministic RB images, or netplay digests. */
     size_t (*presentation_state_save)(void *dst, size_t capacity);
     int (*presentation_state_load)(const void *src, size_t size, int apply);
+    /* Optional host-only GPU post-presentation pass (e.g., Mode B+ neural).
+     * Never alters guest state, WRAM, snapshots or netplay digests. */
+    int (*present_gpu_enabled)(void);
+    struct SDL_Texture *(*present_gpu)(struct SDL_Renderer *renderer,
+                                       struct SDL_Texture *activation,
+                                       const uint32_t *argb,
+                                       int width, int height, int stride_px,
+                                       const struct GVDPRasterFrame *raster);
+    void (*present_gpu_destroy)(void);
 } GameVideo;
 
 /* Host-local derived frame plan, never deterministic machine/snapshot state.

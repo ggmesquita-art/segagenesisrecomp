@@ -138,7 +138,8 @@ function(genesisrecomp_runner_sources out_var)
     endif()
     list(APPEND _list
         "${GENESIS_RUNNER_ENGINE_ROOT}/recompiler/src/m68k_decoder.c"
-        "${GENESIS_RUNNER_ENGINE_ROOT}/recompiler/src/rom_parser.c")
+        "${GENESIS_RUNNER_ENGINE_ROOT}/recompiler/src/rom_parser.c"
+        "${GENESIS_RUNNER_ENGINE_ROOT}/external/m68k-recomp-core/common/m68k_timing.c")
     set(${out_var} "${_list}" PARENT_SCOPE)
 endfunction()
 
