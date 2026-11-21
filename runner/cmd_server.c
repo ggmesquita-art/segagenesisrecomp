@@ -34,6 +34,7 @@ typedef int sock_t;
 #include <stdint.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "cmd_server.h"
 #include "owner_review.h"
@@ -442,8 +443,40 @@ static void send_response(const char *json)
 {
     if (s_client == SOCK_INVALID) return;
     int len = (int)strlen(json);
-    send(s_client, json, len, 0);
-    send(s_client, "\n", 1, 0);
+    /* The client socket is non-blocking (set_nonblocking at accept), so a
+     * single send() truncates large responses once the kernel buffer is
+     * full and the client never sees the trailing newline. Loop until the
+     * payload (plus the '\n' terminator) is fully queued, yielding briefly
+     * on EAGAIN/EWOULDBLOCK. Debug-path only — no effect on gameplay. */
+    const char *bufs[2] = { json, "\n" };
+    int lens[2] = { len, 1 };
+    for (int i = 0; i < 2; i++) {
+        const char *p = bufs[i];
+        int left = lens[i];
+        while (left > 0) {
+#ifdef _WIN32
+            int n = send(s_client, p, left, 0);
+            if (n == SOCKET_ERROR) {
+                int e = WSAGetLastError();
+                if (e == WSAEWOULDBLOCK || e == WSAEINTR) { Sleep(1); continue; }
+                return;
+            }
+#else
+            int n = (int)send(s_client, p, left, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    struct timespec ts = { 0, 1000000 }; /* 1 ms */
+                    nanosleep(&ts, NULL);
+                    continue;
+                }
+                return;
+            }
+#endif
+            if (n == 0) return;
+            p += n;
+            left -= n;
+        }
+    }
 }
 
 static void send_ok(int id)

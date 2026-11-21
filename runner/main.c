@@ -1303,6 +1303,7 @@ static const char *resolve_runner_path(const char *path, char *buf, size_t buf_l
  * layout (superzazu z80 embedded in g_machine, no side ext blob); GROWNS1
  * and GROWNS2 saves are rejected with a clear message rather than misloaded. */
 static const char OWN_SAVE_MAGIC[8] = "GROWNS3\0";
+static const char OWN_SAVE_MAGIC_V2[8] = "ECRB2sav";
 #include "host_state.h"
 
 int runner_save_state_file(const char *path)
@@ -1325,14 +1326,18 @@ int runner_save_state_file(const char *path)
         return 0;
     }
 
-    extern uint8_t g_ram[0x010000];
-    int ok = fwrite(OWN_SAVE_MAGIC, 1, sizeof(OWN_SAVE_MAGIC), sf) == sizeof(OWN_SAVE_MAGIC);
-    glue_save_state(sf);
-    ok = ok && fwrite(g_ram, 1, 0x10000, sf) == 0x10000;
-    ok = ok && machine_save_state(sf);
-    ok = ok && ym2612_save_state(sf);
-    ok = ok && psg_save_state(sf);
-    ok = ok && !ferror(sf);
+    /* V2 format: magic + version + portable rollback blob (all sections
+     * except exec, which carries the guest PC). Same machinery the rewind
+     * uses — complete and validated — but portable across processes. */
+    size_t cap = genesis_rb_bound();
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    size_t blob = buf ? genesis_rb_save_portable(buf, cap) : 0;
+    int ok = blob > 0 &&
+             fwrite(OWN_SAVE_MAGIC_V2, 1, sizeof(OWN_SAVE_MAGIC_V2), sf) == sizeof(OWN_SAVE_MAGIC_V2) &&
+             fwrite(&blob, 1, sizeof(blob), sf) == sizeof(blob) &&
+             fwrite(buf, 1, blob, sf) == blob &&
+             !ferror(sf);
+    free(buf);
     fclose(sf);
 
     if (ok)
@@ -1369,57 +1374,68 @@ int runner_load_state_file(const char *path)
 
     char magic[8];
     if (fread(magic, 1, sizeof(magic), sf) != sizeof(magic) ||
-        memcmp(magic, OWN_SAVE_MAGIC, sizeof(magic)) != 0) {
-        fprintf(stderr, "[LOAD] %s is not an own-backend save (old format?)\n", resolved);
+        memcmp(magic, OWN_SAVE_MAGIC_V2, sizeof(magic)) != 0) {
+        fprintf(stderr, "[LOAD] %s is not a V2 own-backend save (old format?)\n", resolved);
         fclose(sf);
         return 0;
     }
+    size_t blob_len = 0;
+    if (fread(&blob_len, 1, sizeof(blob_len), sf) != sizeof(blob_len) ||
+        blob_len == 0 || blob_len > genesis_rb_bound()) {
+        fprintf(stderr, "[LOAD] %s truncated or oversized (%zu bytes)\n", resolved, blob_len);
+        fclose(sf);
+        return 0;
+    }
+    uint8_t *blob = (uint8_t *)malloc(blob_len);
+    if (!blob || fread(blob, 1, blob_len, sf) != blob_len) {
+        fprintf(stderr, "[LOAD] %s read failed\n", resolved);
+        free(blob);
+        fclose(sf);
+        return 0;
+    }
+    fclose(sf);
 
-    extern uint8_t g_ram[0x010000];
-    /* The legacy readers apply sections in place. A later short read must
-     * not leave a rejected file's CPU/RAM/chips installed in the live game.
-     * This snapshot is in-process only; current-build cold saves still use
-     * their existing resume path. Battery progress files are independent. */
+    /* Snapshot of the live state so a rejected load can roll back. */
     size_t backup_cap = genesis_rb_bound();
     uint8_t *backup = (uint8_t *)malloc(backup_cap);
     size_t backup_len = backup ? genesis_rb_save(backup, backup_cap) : 0;
     if (!backup_len) {
         free(backup);
-        fclose(sf);
+        free(blob);
         fprintf(stderr, "[LOAD] could not preserve current state: %s\n", resolved);
         return 0;
     }
-    int ok = 1;
-    glue_load_state(sf);
-    ok = ok && fread(g_ram, 1, 0x10000, sf) == 0x10000;
-    ok = ok && machine_load_state(sf);
-    ok = ok && ym2612_load_state(sf);
-    ok = ok && psg_load_state(sf);
-    ok = ok && fgetc(sf) == EOF && !ferror(sf);
-    fclose(sf);
+
+    uint32_t resume_pc = 0;
+    int inplace_ok = glue_prepare_inplace_load();
+    int ok = genesis_rb_load_portable(blob, blob_len, &resume_pc);
 
     if (!ok && !genesis_rb_load(backup, backup_len)) {
         fprintf(stderr, "[LOAD] fatal: could not restore pre-load state\n");
         abort();
     }
     free(backup);
-
-    /* Drop any chip writes queued by the frame the save interrupted; the
-     * restored chips already contain their effect. */
-    if (ok) audio_event_queue_reset();
+    free(blob);
 
     if (ok) {
-        /* Mode-aware resume: re-enter at the restored Game_Mode's per-frame
-         * loop top (moment-in-time) when the game maps one; otherwise fall
-         * back to the outer dispatcher (mode-handler re-entry / reload). */
-        uint32_t resume_pc = g_game_spec.resume_main_loop_pc;
-        if (g_game_spec.save_resume_pc && g_game_layout.game_mode_addr) {
-            uint32_t pc = g_game_spec.save_resume_pc(
-                glue_peek8(g_game_layout.game_mode_addr));
-            if (pc) resume_pc = pc;
+        /* In-place resume: the game fiber is still parked at its vblank
+         * wait; the restored state dispatches on the next frame through the
+         * intact boot chain. Only cold-fallback when the fiber is not
+         * parked (e.g., load before the first frame). */
+        if (inplace_ok) {
+            glue_finish_inplace_load();
+        } else {
+            uint32_t pc = g_game_spec.resume_main_loop_pc;
+            if (g_game_spec.save_resume_pc && g_game_layout.game_mode_addr) {
+                uint32_t p2 = g_game_spec.save_resume_pc(
+                    glue_peek8(g_game_layout.game_mode_addr));
+                if (p2) pc = p2;
+            }
+            if (!pc)
+                pc = resume_pc;
+            if (pc)
+                glue_restart_game_fiber_keep_a7(pc);
         }
-        if (resume_pc)
-            glue_restart_game_fiber(resume_pc);
     }
 
     if (ok)
@@ -1469,6 +1485,34 @@ static int s_sram_io_pending;
 static unsigned char *sram_buf(void)  { return gbus_sram_buffer(&g_machine.bus); }
 static size_t         sram_size(void) { return (size_t)gbus_sram_size(&g_machine.bus); }
 static int            sram_battery_present(void) { return sram_size() != 0; }
+
+/* Cold reset (F10): fresh machine + zeroed work RAM + the game fiber rebooted
+ * from the reset vector. Battery SRAM survives (user progress). */
+static void runner_cold_reset(void)
+{
+    size_t n = sram_size();
+    uint8_t *sram_copy = NULL;
+    if (n > 0) {
+        sram_copy = (uint8_t *)malloc(n);
+        if (sram_copy) memcpy(sram_copy, sram_buf(), n);
+    }
+    extern uint8_t g_ram[0x010000];
+    memset(g_ram, 0, sizeof(g_ram));
+    /* g_cpu D/A registers are left as-is; the fiber boot re-initialises A7/SR
+     * and the game's boot code sets up everything else (real hardware boots
+     * with garbage registers too). */
+    machine_init();
+    if (sram_copy) {
+        memcpy(sram_buf(), sram_copy, n);
+        free(sram_copy);
+    }
+    audio_event_queue_reset();
+    { extern unsigned long g_snd_frame; g_snd_frame = 0; }
+    if (g_game_spec.video && g_game_spec.video->presentation_reset)
+        g_game_spec.video->presentation_reset();
+    fprintf(stderr, "[RESET] cold reset (F10) — booting from reset vector\n");
+    glue_restart_game_fiber(0);
+}
 
 static uint64_t sram_content_hash(void)
 {
@@ -3377,7 +3421,7 @@ int main(int argc, char *argv[])
         uint32_t addrs_hi[32];
         int n_addrs = 0;
         int frames = 0;
-        char buf[256];
+        char buf[1024];
         strncpy(buf, mem_write_log_spec, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = '\0';
         char *at = strchr(buf, '@');
@@ -3716,6 +3760,11 @@ session_begin:;
                     { extern void chip_trace_dump(const char *path); chip_trace_dump("chip_ring.txt"); }
                     { extern void snd_trace_dump(const char *path); snd_trace_dump("snd_ring.txt"); }
                 }
+                /* F10 = cold reset (fresh boot; battery SRAM survives). */
+                if (ev.key.keysym.sym == SDLK_F10 && !ev.key.repeat) {
+                    cancel_load_hold();
+                    runner_cold_reset();
+                }
             }
         }
 
@@ -3977,9 +4026,10 @@ session_begin:;
         {
             extern unsigned long g_z80poll_fallback_hits, g_z80poll_yields, g_spin_yields;
             if ((frame_num % 120u) == 0)
-                fprintf(stderr, "[POLL-DIAG] frame=%u fallback_hits=%lu yields=%lu spin_yields=%lu\n",
+                fprintf(stderr, "[POLL-DIAG] frame=%u fallback_hits=%lu yields=%lu spin_yields=%lu spin=$%06X spin_count=%d PC=$%06X\n",
                         (unsigned)frame_num, g_z80poll_fallback_hits, g_z80poll_yields,
-                        g_spin_yields);
+                        g_spin_yields, (unsigned)glue_spin_addr(), glue_spin_count(),
+                        (unsigned)glue_get_pc());
         }
 #endif
 
@@ -4098,6 +4148,8 @@ session_begin:;
                     if (input_script_take_restart_game(&restart_pc))
                         glue_restart_game_fiber(restart_pc);
                 }
+                if (input_script_take_cold_reset())
+                    runner_cold_reset();
                 if (input_script_take_ram_dump(state_path, sizeof(state_path)))
                     runner_dump_ram_file(state_path);
                 if (input_script_take_vram_dump(state_path, sizeof(state_path)))
@@ -4248,7 +4300,9 @@ session_begin:;
         const SDL_Rect *base_upload_rect =
             s_frame_texture_filtered ? NULL : &upload_rect;
         SDL_Texture *frame_texture = texture;
-        if(s_hd_requested&&!ui_open&&!netplay_peer_view_active()&&!s_video_frame.owner) {
+        if(s_hd_requested&&!ui_open&&!netplay_peer_view_active()&&!s_video_frame.owner
+           &&!(g_game_spec.video&&g_game_spec.video->present_gpu_enabled&&
+               g_game_spec.video->present_gpu_enabled())) {
             if(!hd_checked){hd_gpu=genesis_hd_gpu_create(renderer,texture);hd_checked=1;
                 if(!hd_gpu)fprintf(stderr,"[HD_GPU] unavailable; native presentation retained\n");}
             const GVDPRasterFrame *job=gvdp_hd_acquire();

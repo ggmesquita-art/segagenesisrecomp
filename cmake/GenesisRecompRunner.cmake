@@ -93,7 +93,8 @@ set(GENESIS_RUNNER_CORE_SOURCES
     video/genesis_bus.c
     video/genesis_machine.c
     external/superzazu/z80.c
-    m68k_interp.c)
+    m68k_interp.c
+    game_cycles.c)
 
 # Core sources an unmigrated consumer may be missing and that the reconciler
 # is allowed to add. Everything else in the core list predates this module
