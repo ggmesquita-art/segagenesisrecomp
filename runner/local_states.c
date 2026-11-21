@@ -14,6 +14,7 @@
 
 int runner_save_state_file(const char *path);
 int runner_load_state_file(const char *path);
+void runner_stage_load_state(const char *path);
 
 #define THUMB_W 128
 #define THUMB_H 90
@@ -291,11 +292,9 @@ int genesis_local_states_accept(void)
     if (s_mode == 2 && s_slot_exists[s_selected]) {
         char path[640];
         path_for_slot(s_selected + 1, 0, path, sizeof path);
-        if (runner_load_state_file(path)) {
-            genesis_local_states_cancel();
-            return 1;
-        }
-        snprintf(s_status, sizeof s_status, "LOAD FAILED");
+        runner_stage_load_state(path);
+        genesis_local_states_cancel();
+        return 1;
     }
     return 0;
 }

@@ -53,6 +53,14 @@ static SDL_Keycode s_load_key;
 static int s_load_hold_focused;
 static SDL_Texture *s_load_hold_texture;
 
+/* Interactive loads are staged here and applied at the post-frame safe point
+ * (next to the input-script tick), so the blob swap always happens with the
+ * whole system parked between frames — the same place the validated scripted
+ * LOAD_STATE applies. Applying it mid-loop (the hotkey path runs before the
+ * frame, while the game fiber may be yielded at a non-vblank site) made the
+ * first load of a session resume irregularly — the reported hang. */
+static char s_pending_load_path[512] = "";
+
 static void cancel_load_hold(void)
 {
     genesis_load_hold_cancel(&s_load_hold);
@@ -1345,6 +1353,14 @@ int runner_save_state_file(const char *path)
     else
         fprintf(stderr, "[SAVE] failed while writing %s\n", resolved);
     return ok;
+}
+
+/* Interactive load staging: the modal and the hotkey hold store the target
+ * path here; the post-frame safe point applies it. See s_pending_load_path. */
+void runner_stage_load_state(const char *path)
+{
+    if (path && *path)
+        snprintf(s_pending_load_path, sizeof(s_pending_load_path), "%s", path);
 }
 
 int runner_load_state_file(const char *path)
@@ -3838,7 +3854,8 @@ session_begin:;
             if (slot) {
                 char slot_name[48];
                 snprintf(slot_name, sizeof(slot_name), "native_save_%d.bin", slot);
-                runner_load_state_file(slot_name);
+                /* Stage: applied at the post-frame safe point. */
+                snprintf(s_pending_load_path, sizeof(s_pending_load_path), "%s", slot_name);
             }
         }
 
@@ -4183,6 +4200,16 @@ session_begin:;
                 genesis_replay_shutdown();
                 return input_script_exit_code();
             }
+        }
+
+        /* Staged interactive load (hotkey hold): apply at this post-frame
+         * safe point — the whole system is parked between frames, matching
+         * the validated scripted LOAD_STATE path. */
+        if (s_pending_load_path[0]) {
+            char staged_path[512];
+            snprintf(staged_path, sizeof(staged_path), "%s", s_pending_load_path);
+            s_pending_load_path[0] = 0;
+            runner_load_state_file(staged_path);
         }
 
         /* FNV-1a-64 hash of the framebuffer's active region. Emitted
