@@ -57,18 +57,19 @@ void input_map_init_defaults(void)
     p1->pad_type     = PAD_3BUTTON;
     p1->deadzone_pct = 25;
     /* Keyboard arrows + Z/X/C + Return (the existing main.c mapping), plus
-     * A/S/D/Tab for the 6-button extension. Gamepad: d-pad + A/B/X/Start, with
-     * Y/LB/RB/Back for X/Y/Z/Mode. */
+     * A/S/D/Tab for the 6-button extension. Gamepad: positional Sega-style
+     * layout for XBOX controllers (and the same positions on any SDL-mapped
+     * pad): Genesis A/B/C (the three attack buttons in Eternal Champions)
+     * on face X/A/B, Genesis X on Y, Y/Z on the shoulders, Mode on Back. */
     set_btn(p1, GB_UP,    SDL_SCANCODE_UP,     SDL_CONTROLLER_BUTTON_DPAD_UP);
     set_btn(p1, GB_DOWN,  SDL_SCANCODE_DOWN,   SDL_CONTROLLER_BUTTON_DPAD_DOWN);
     set_btn(p1, GB_LEFT,  SDL_SCANCODE_LEFT,   SDL_CONTROLLER_BUTTON_DPAD_LEFT);
     set_btn(p1, GB_RIGHT, SDL_SCANCODE_RIGHT,  SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
-    /* Pad: Genesis B (the primary action/jump on most carts) sits on the
-     * face-bottom button (Cross on DualSense, A on Xbox); Genesis A on the
-     * face-right button. More natural for PlayStation pads (user request). */
-    set_btn(p1, GB_A,     SDL_SCANCODE_Z,      SDL_CONTROLLER_BUTTON_B);
+    /* Genesis A = punch (face-left), B = kick (face-bottom), C = face-right —
+     * the classic Sega positional mapping (Sega Genesis Classics style). */
+    set_btn(p1, GB_A,     SDL_SCANCODE_Z,      SDL_CONTROLLER_BUTTON_X);
     set_btn(p1, GB_B,     SDL_SCANCODE_X,      SDL_CONTROLLER_BUTTON_A);
-    set_btn(p1, GB_C,     SDL_SCANCODE_C,      SDL_CONTROLLER_BUTTON_X);
+    set_btn(p1, GB_C,     SDL_SCANCODE_C,      SDL_CONTROLLER_BUTTON_B);
     set_btn(p1, GB_START, SDL_SCANCODE_RETURN, SDL_CONTROLLER_BUTTON_START);
     set_btn(p1, GB_X,     SDL_SCANCODE_A,      SDL_CONTROLLER_BUTTON_Y);
     set_btn(p1, GB_Y,     SDL_SCANCODE_S,      SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
@@ -80,14 +81,14 @@ void input_map_init_defaults(void)
     p2->pad_type     = PAD_3BUTTON;
     p2->deadzone_pct = 25;
     /* A usable right-hand keyboard set + second gamepad, ready when the user
-     * enables P2 in the launcher. */
+     * enables P2 in the launcher. Same positional Sega-style pad layout. */
     set_btn(p2, GB_UP,    SDL_SCANCODE_I,      SDL_CONTROLLER_BUTTON_DPAD_UP);
     set_btn(p2, GB_DOWN,  SDL_SCANCODE_K,      SDL_CONTROLLER_BUTTON_DPAD_DOWN);
     set_btn(p2, GB_LEFT,  SDL_SCANCODE_J,      SDL_CONTROLLER_BUTTON_DPAD_LEFT);
     set_btn(p2, GB_RIGHT, SDL_SCANCODE_L,      SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
-    set_btn(p2, GB_A,     SDL_SCANCODE_N,      SDL_CONTROLLER_BUTTON_B);
+    set_btn(p2, GB_A,     SDL_SCANCODE_N,      SDL_CONTROLLER_BUTTON_X);
     set_btn(p2, GB_B,     SDL_SCANCODE_M,      SDL_CONTROLLER_BUTTON_A);
-    set_btn(p2, GB_C,     SDL_SCANCODE_COMMA,  SDL_CONTROLLER_BUTTON_X);
+    set_btn(p2, GB_C,     SDL_SCANCODE_COMMA,  SDL_CONTROLLER_BUTTON_B);
     set_btn(p2, GB_START, SDL_SCANCODE_RSHIFT, SDL_CONTROLLER_BUTTON_START);
     set_btn(p2, GB_X,     SDL_SCANCODE_U,      SDL_CONTROLLER_BUTTON_Y);
     set_btn(p2, GB_Y,     SDL_SCANCODE_O,      SDL_CONTROLLER_BUTTON_LEFTSHOULDER);

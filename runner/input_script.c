@@ -41,6 +41,7 @@ typedef enum {
     OP_WRITE_RAM32,
     OP_WRITE_CPU_A7,
     OP_RESTART_GAME,
+    OP_COLD_RESET,
     OP_SCREENSHOT,
     OP_SAVE_STATE,
     OP_LOAD_STATE,
@@ -76,6 +77,7 @@ static char     s_pending_screenshot[260];
 static char     s_pending_save_state[260];
 static char     s_pending_load_state[260];
 static uint32_t s_pending_restart_game;
+static int      s_pending_cold_reset = 0;
 static char     s_pending_ram_dump[260];
 static char     s_pending_vram_dump[260];
 
@@ -188,6 +190,8 @@ static int parse_line(char *line, int line_no) {
     } else if (!_stricmp(tok, "RESTART_GAME") && n == 2) {
         o->op = OP_RESTART_GAME;
         if (!parse_u24_hex(a1, 0, &o->arg32)) goto bad;
+    } else if (!_stricmp(tok, "COLD_RESET")) {
+        o->op = OP_COLD_RESET;
     } else if (!_stricmp(tok, "SCREENSHOT")) {
         o->op = OP_SCREENSHOT;
         if (n >= 2) snprintf(o->str, sizeof(o->str), "%s", a1);
@@ -387,6 +391,13 @@ void input_script_tick(uint64_t frame,
                 s_pc++;
                 break;
 
+            case OP_COLD_RESET:
+                s_pending_cold_reset = 1;
+                fprintf(stderr, "[input_script] COLD_RESET requested at frame %llu\n",
+                        (unsigned long long)frame);
+                s_pc++;
+                break;
+
             case OP_SCREENSHOT:
                 snprintf(s_pending_screenshot, sizeof(s_pending_screenshot), "%s", o->str);
                 /* Wired by the main loop next frame — see input_script_pending_screenshot. */
@@ -477,6 +488,14 @@ bool input_script_take_restart_game(uint32_t *pc)
     if (pc)
         *pc = s_pending_restart_game;
     s_pending_restart_game = 0;
+    return true;
+}
+
+bool input_script_take_cold_reset(void)
+{
+    if (!s_pending_cold_reset)
+        return false;
+    s_pending_cold_reset = 0;
     return true;
 }
 

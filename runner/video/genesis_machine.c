@@ -55,7 +55,7 @@ typedef struct {
     uint64_t master;
     const char *tag;                 /* BUS only: REQ / RESET_OFF / REQ-READack */
 } SndEvt;
-#define SND_RING_N 65536u
+#define SND_RING_N (1u << 19)
 static SndEvt   g_snd_ring[SND_RING_N];
 static unsigned g_snd_head = 0;
 static SndEvt *snd_evt(uint8_t type) {
@@ -366,6 +366,12 @@ void machine_set_pad(int port, uint16_t buttons)
 {
     if (port >= 0 && port < 2) {
         g_machine.bus.pad[port] = buttons;
+        if (buttons && port == 0 && (getenv("EC_PAD_DIAG") != NULL)) {
+            static uint16_t s_last = 0xFFFF;
+            if (buttons != s_last)
+                fprintf(stderr, "[PAD-DIAG] P1 mask=%04X\n", buttons);
+            s_last = buttons;
+        }
         /* New read burst this frame: clear the 6-button TH edge counter so the
          * controller protocol restarts from the 3-button reads (models the
          * ~1.5ms hardware timeout between bursts). */

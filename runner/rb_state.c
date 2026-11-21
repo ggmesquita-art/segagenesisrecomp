@@ -41,8 +41,8 @@ _Static_assert(sizeof(g_ram) == 0x10000, "work RAM size changed");
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFu
 /* 64-bit layouts (the host pointers inside are scrubbed by machine_rb_save). */
 _Static_assert(sizeof(GVDP) == 65824, "GVDP changed: review machine_rb_save (pointers) and rb_state");
-_Static_assert(sizeof(GenesisBus) == 24664, "GenesisBus changed: review machine_rb_save and rb_state");
-_Static_assert(sizeof(GenesisMachine) == 90576, "GenesisMachine changed: review machine_rb_save and rb_state");
+_Static_assert(sizeof(GenesisBus) == 24688, "GenesisBus changed: review machine_rb_save and rb_state");
+_Static_assert(sizeof(GenesisMachine) == 90600, "GenesisMachine changed: review machine_rb_save and rb_state");
 #endif
 
 /* ---- sections ---------------------------------------------------------------- */
@@ -175,6 +175,7 @@ static const RbSection k_sections[] = {
     { "game",    GENESIS_RB_PART_GAME,  sec_game_save,      sec_game_load,      digest_bytes   },
 };
 #define RB_NSEC (sizeof k_sections / sizeof k_sections[0])
+#define RB_SEC_INPUT 8u   /* índice da seção "input" em k_sections */
 
 static const char *const k_part_names[GENESIS_RB_PART_COUNT] = {
     "exec", "cpu", "sched", "ram", "vdp", "bus", "z80", "fm", "psg", "evq", "input", "game"
@@ -288,6 +289,87 @@ int genesis_rb_load(const void *src, size_t len)
     /* Presentation history is disposable, never part of the restored digest.
      * Direct rollback/probe loads bypass the frontend's file-load callbacks. */
     if(g_game_spec.video && g_game_spec.video->presentation_reset)
+        g_game_spec.video->presentation_reset();
+    return 1;
+}
+
+/* ---- portable (cross-process) file-state variants --------------------------
+ * Same section table and framing as the rollback blob, except the exec
+ * section (host addresses) is replaced by the guest PC. */
+
+size_t genesis_rb_save_portable(void *dst, size_t cap)
+{
+    uint8_t *o = (uint8_t *)dst, *end = o + cap;
+    uint32_t nsec = (uint32_t)RB_NSEC;
+    if (!dst || cap < sizeof k_magic + sizeof nsec + sizeof(uint64_t)) return 0;
+    memcpy(o, k_magic, sizeof k_magic); o += sizeof k_magic;
+    memcpy(o, &nsec, sizeof nsec);      o += sizeof nsec;
+    memset(o, 0, sizeof(uint64_t));     o += sizeof(uint64_t);
+    for (size_t i = 0; i < RB_NSEC; i++) {
+        size_t need = k_sections[i].save(NULL, 0);
+        uint32_t got;
+        if (i == 0) {
+            /* exec -> 24-bit guest PC (portable resume point) */
+            need = sizeof(uint32_t);
+            if ((size_t)(end - o) < sizeof(uint32_t) + need) return 0;
+            uint32_t pc = g_cpu.PC & 0xFFFFFFu;
+            memcpy(o + sizeof(uint32_t), &pc, sizeof pc);
+            got = (uint32_t)need;
+        } else if (i == RB_SEC_INPUT) {
+            /* input -> não restaurado no file save (evita "botões fantasma"
+             * do momento do save; o load usa o input ao vivo) */
+            need = 0;
+            if ((size_t)(end - o) < sizeof(uint32_t)) return 0;
+            got = 0;
+        } else {
+            if ((size_t)(end - o) < sizeof(uint32_t) + need) return 0;
+            if (need && k_sections[i].save(o + sizeof(uint32_t), need) == 0) {
+                fprintf(stderr, "[rb_state] portable save: section %s failed\n",
+                        k_sections[i].name);
+                return 0;
+            }
+            got = (uint32_t)need;
+        }
+        memcpy(o, &got, sizeof got);
+        o += sizeof got + got;
+    }
+    return (size_t)(o - (uint8_t *)dst);
+}
+
+int genesis_rb_load_portable(const void *src, size_t len, uint32_t *out_pc)
+{
+    size_t off[RB_NSEC], sl[RB_NSEC];
+    const uint8_t *b = (const uint8_t *)src;
+    if (!rb_frame(b, len, off, sl)) {
+        fprintf(stderr, "[rb_state] portable load: malformed blob (%zu bytes)\n", len);
+        return 0;
+    }
+#if GENESIS_HD_JOBS
+    gvdp_hd_reset();
+#endif
+    uint32_t pc = 0;
+    for (size_t i = 0; i < RB_NSEC; i++) {
+        if (i == 0) {
+            if (sl[i] != sizeof(uint32_t)) {
+                fprintf(stderr, "[rb_state] portable load: bad exec carrier (%zu bytes)\n", sl[i]);
+                return 0;
+            }
+            memcpy(&pc, b + off[i], sizeof pc);
+            continue;
+        }
+        if (i == RB_SEC_INPUT) {
+            continue;   /* input ao vivo, nunca restaurado do arquivo */
+        }
+        if (sl[i] == 0 && k_sections[i].save(NULL, 0) == 0) continue;   /* empty game */
+        if (!k_sections[i].load(b + off[i], sl[i])) {
+            fprintf(stderr, "[rb_state] portable load: section %s rejected (%zu bytes)\n",
+                    k_sections[i].name, sl[i]);
+            return 0;
+        }
+    }
+    if (out_pc)
+        *out_pc = pc & 0xFFFFFFu;
+    if (g_game_spec.video && g_game_spec.video->presentation_reset)
         g_game_spec.video->presentation_reset();
     return 1;
 }

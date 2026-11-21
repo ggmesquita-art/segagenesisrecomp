@@ -80,6 +80,13 @@ size_t genesis_rb_save(void *dst, size_t cap);
  * process wrote) the machine is left partially restored and 0 returned. */
 int genesis_rb_load(const void *src, size_t len);
 
+/* Portable (cross-process) variants for FILE save states: the exec section
+ * carries host addresses and is replaced by the guest PC (24-bit); the load
+ * restores every other section and reports that PC so the caller can
+ * restart the game fiber at it (glue_restart_game_fiber). */
+size_t genesis_rb_save_portable(void *dst, size_t cap);
+int genesis_rb_load_portable(const void *src, size_t len, uint32_t *out_pc);
+
 /* Partitioned digest of the live state (reads only). */
 void genesis_rb_digest(GenesisRbDigest *out);
 const char *genesis_rb_digest_implementation(void);

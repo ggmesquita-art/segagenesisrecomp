@@ -1149,18 +1149,14 @@ static M68kiStatus exec_one(const M68KInstr *ins, uint32_t *next_pc) {
 /* The emit_cycle_accounting() tail, executed after one interpreted instruction. */
 static void interp_account_cycles(const M68KInstr *ins) {
     int cyc = -1;
-    /* Charge the SAME measured cost the recompiled code was stamped with
-     * (the recompiler-emitted per-instruction table), so the interpreter's
-     * g_audio_cycle_counter and the scanline-budget expiry converge with the
-     * recomp instead of drifting on the nominal PRM estimate. Drift here is
-     * user-visible: in states whose frame loop has no end-of-frame raster
-     * wait (e.g. the main menu), a divergent budget expiry shifts where the
-     * per-scanline V-int lands in the instruction stream, and the menu task
-     * schedule desyncs vs the recompiled build (~2 wall frames after ~85
-     * frames — the training-mode black-screen bug, T2).
-     * Falls back to the nominal estimate for addresses not in the table
-     * (RAM-resident code, which this game does not execute). */
+#ifdef GENESIS_COSIM
+    /* Charge the SAME clown-measured cost the recompiled code was stamped with,
+     * so g_audio_cycle_counter converges with the recomp instead of drifting on
+     * a PRM estimate. Falls back to the estimate for addresses not in the table
+     * (RAM-resident code). Gated to the cosim build for now — enabling it in the
+     * shipping floor is a validated pacing change (see game_cycles.h). */
     cyc = game_insn_cost(ins->addr);
+#endif
     if (cyc < 0) cyc = (int)m68k_68000_nominal_cycles(ins);
     if (cyc < 0) cyc = 4;                          /* never stall the clock */
     g_native_insn_count++;

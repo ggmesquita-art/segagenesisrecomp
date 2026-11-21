@@ -35,10 +35,20 @@ void glue_wait_vblank_done(void);
  * outside the emulator core. */
 void glue_save_state(FILE *sf);
 void glue_load_state(FILE *sf);
+
+/* [POLL-DIAG] spin-detect telemetry: address/streak of the current
+ * busy-wait read streak (main-context reads only). 0 = no streak. */
+uint32_t glue_spin_addr(void);
+int      glue_spin_count(void);
+uint32_t glue_get_pc(void);
+int      glue_spin_count(void);
 /* Re-enter the game at resume_pc (0 = cold entry) by resetting the game
  * fiber IN PLACE (same engine-owned stack; see fiber_compat.h). Must be
  * called from the scheduler (main) fiber. */
 void glue_restart_game_fiber(uint32_t resume_pc);
+void glue_restart_game_fiber_keep_a7(uint32_t resume_pc);
+int  glue_prepare_inplace_load(void);
+void glue_finish_inplace_load(void);
 
 /* Scheduler rule (see glue.c): the same-address spin streak and the Z80
  * sync-poll streak restart at every wall-frame boundary. The tick driver

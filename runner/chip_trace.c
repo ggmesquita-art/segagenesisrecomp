@@ -41,7 +41,7 @@ typedef struct {
     uint16_t line, pcz;
     uint8_t kind, port, val, pad;
 } ChipEvt;
-#define CHIP_RING_N 262144u          /* ~16 s of history at peak DAC rate */
+#define CHIP_RING_N (1u << 21)       /* ~2 min of history at peak DAC rate */
 static ChipEvt   g_chip_ring[CHIP_RING_N];
 static unsigned  g_chip_head = 0;
 

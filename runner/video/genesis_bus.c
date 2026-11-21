@@ -89,10 +89,11 @@ extern void glue_charge_68k_stall(uint32_t cycles);
  *
  * The audio chips themselves are rendered later from the stamped write queue,
  * so this small synchronous model exists solely for CPU-visible status reads.
- * It deliberately models BUSY as always clear; only timer flag B is currently
- * needed by supported software. */
+ * It deliberately models BUSY as always clear; supported software needs both
+ * timer flags: timer B (RKA) and timer A (Eternal Champions). */
 #define MASTER_CYCLES_PER_FRAME  (262ull * 3420ull)
 #define YM_TIMER_B_MASTER_TICK   (16ull * 144ull * 7ull)
+#define YM_TIMER_A_MASTER_TICK   (144ull * 7ull)   /* one FM sample period */
 
 static uint64_t ym_abs_z80_stamp(void)
 {
@@ -108,6 +109,22 @@ static uint64_t ym_abs_68k_stamp(void)
 
 static void ym_timer_update(GenesisBus *b, uint64_t now)
 {
+    /* Timer A: decrements once per FM output sample (144 chip clocks = 1008
+     * master cycles), matching the GPGX oracle's INTERNAL_TIMER_A cadence.
+     * Overflow sets status bit 0 when $27 bit 2 (b2) gates the flag. */
+    if (b->ym_timer_a_running && b->ym_timer_a_period != 0 &&
+        now >= b->ym_timer_a_deadline)
+    {
+        if (b->ym_mode & 0x04u)             /* enable timer-A overflow flag */
+            b->ym_status |= 0x01u;
+
+        /* Timer A is periodic while run/load bit 0 remains set. Advance the
+         * deadline past 'now' without an unbounded catch-up loop. */
+        uint64_t elapsed = now - b->ym_timer_a_deadline;
+        uint64_t periods = elapsed / b->ym_timer_a_period + 1u;
+        b->ym_timer_a_deadline += periods * b->ym_timer_a_period;
+    }
+
     if (!b->ym_timer_b_running || b->ym_timer_b_period == 0 ||
         now < b->ym_timer_b_deadline)
         return;
@@ -134,14 +151,32 @@ static void ym_write_side_effect(GenesisBus *b, uint8_t port, uint8_t val,
     if (bank != 0) return;              /* timers live in register bank 0 */
 
     uint8_t reg = b->ym_addr[0];
-    if (reg == 0x26u) {
+    if (reg == 0x24u) {
+        /* Timer A MSB: bits 2..9 of the 10-bit period. */
+        b->ym_timer_a = (uint16_t)((b->ym_timer_a & 0x03u) |
+                                   ((uint16_t)val << 2));
+        b->ym_timer_a_period =
+            (uint64_t)(1024u - (unsigned)b->ym_timer_a) *
+            YM_TIMER_A_MASTER_TICK;
+        if (b->ym_timer_a_period == 0) b->ym_timer_a_period = 1u;
+    } else if (reg == 0x25u) {
+        /* Timer A LSB: bits 0..1 of the 10-bit period. */
+        b->ym_timer_a = (uint16_t)((b->ym_timer_a & 0x3FCu) |
+                                   ((uint16_t)val & 0x03u));
+        b->ym_timer_a_period =
+            (uint64_t)(1024u - (unsigned)b->ym_timer_a) *
+            YM_TIMER_A_MASTER_TICK;
+        if (b->ym_timer_a_period == 0) b->ym_timer_a_period = 1u;
+    } else if (reg == 0x26u) {
         b->ym_timer_b = val;
         b->ym_timer_b_period =
             (uint64_t)(256u - (unsigned)val) * YM_TIMER_B_MASTER_TICK;
     } else if (reg == 0x27u) {
-        /* Bits 4/5 clear timer A/B flags; bit 1 loads/runs timer B; bit 3
-         * enables its overflow flag. RKA writes $3C (clear/stop), updates
-         * $26, then writes $3A (clear/load/run). */
+        /* GPGX-oracle bit layout: b7 CSM, b6 3-slot, b5/b4 reset B/A flags,
+         * b3 enable B flag, b2 enable A flag, b1 load/run B, b0 load/run A.
+         * RKA writes $3C (clear/stop), updates $26, then writes $3A
+         * (clear/load/run); EC writes $15 (reset A flag + enable A flag +
+         * load/run A) and spins on status bit 0. */
         if (val & 0x10u) b->ym_status &= 0xfeu;
         if (val & 0x20u) b->ym_status &= 0xfdu;
         b->ym_mode = val;
@@ -158,6 +193,19 @@ static void ym_write_side_effect(GenesisBus *b, uint8_t port, uint8_t val,
             b->ym_timer_b_running = 1;
         } else {
             b->ym_timer_b_running = 0;
+        }
+        if (val & 0x01u) {
+            if (!b->ym_timer_a_running) {
+                if (b->ym_timer_a_period == 0)
+                    b->ym_timer_a_period =
+                        (uint64_t)(1024u - (unsigned)b->ym_timer_a) *
+                        YM_TIMER_A_MASTER_TICK;
+                if (b->ym_timer_a_period == 0) b->ym_timer_a_period = 1u;
+                b->ym_timer_a_deadline = now + b->ym_timer_a_period;
+            }
+            b->ym_timer_a_running = 1;
+        } else {
+            b->ym_timer_a_running = 0;
         }
     }
 }

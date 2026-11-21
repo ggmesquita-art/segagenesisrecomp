@@ -590,6 +590,8 @@ static void interp_drive_mainloop(uint32_t entry_pc) {
 }
 
 /* Game fiber entry point. */
+static int s_keep_a7_on_resume = 0;
+
 static void game_fiber_func(void *param)
 {
     (void)param;
@@ -599,7 +601,19 @@ static void game_fiber_func(void *param)
     if (s_game_fiber_resume_pc) {
         uint32_t resume_pc = s_game_fiber_resume_pc & 0xFFFFFFu;
         s_game_fiber_resume_pc = 0;
-        g_cpu.A[7] = g_game_layout.initial_ssp;
+        uint32_t restored_a7 = g_cpu.A[7];
+        /* State-restore resumes (file load) keep the restored 68K stack
+         * pointer: the stale call chain below it is the game's boot-time
+         * chain, and stack-sensitive code (match-end sequences) needs it.
+         * Cold resumes (RESTART_GAME etc.) reset to the ROM-header SSP as
+         * before; the game re-initialises its stack from there. */
+        if (!s_keep_a7_on_resume)
+            g_cpu.A[7] = g_game_layout.initial_ssp;
+        fprintf(stderr, "[GAME] %s fiber resume at $%06X (A7: restored $%08X -> %s$%08X)\n",
+                g_game_spec.short_name, resume_pc, restored_a7,
+                s_keep_a7_on_resume ? "kept " : "reset to ",
+                g_cpu.A[7]);
+        s_keep_a7_on_resume = 0;
         if (g_game_spec.call_resume) g_game_spec.call_resume(resume_pc);
         else recomp_call_addr(resume_pc);
         if (g_game_spec.dispatch_main_loop_pc) {
@@ -608,8 +622,19 @@ static void game_fiber_func(void *param)
                     g_game_spec.short_name, resume_pc, dispatch_pc);
             recomp_call_addr(dispatch_pc);
         }
-        fprintf(stderr, "[GAME] %s resume/dispatch returned unexpectedly!\n",
-                g_game_spec.short_name);
+        fprintf(stderr, "[GAME] %s resume/dispatch returned unexpectedly! A7=$%08X SR=$%04X\n",
+                g_game_spec.short_name, g_cpu.A[7], g_cpu.SR);
+        { extern uint8_t g_ram[0x010000];
+          uint32_t sp = g_cpu.A[7] & 0xFFFFFFu;
+          if (sp >= 0xFF0000u && sp + 16 <= 0x1000000u) {
+              unsigned o = sp & 0xFFFFu;
+              fprintf(stderr, "[GAME]   stack@$%06X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      sp, g_ram[o], g_ram[o+1], g_ram[o+2], g_ram[o+3],
+                      g_ram[o+4], g_ram[o+5], g_ram[o+6], g_ram[o+7],
+                      g_ram[o+8], g_ram[o+9], g_ram[o+10], g_ram[o+11],
+                      g_ram[o+12], g_ram[o+13], g_ram[o+14], g_ram[o+15]);
+          }
+        }
         for (;;) yield_to_main(GLUE_YIELD_HALT);
     }
 
@@ -1625,16 +1650,23 @@ void glue_load_state(FILE *sf)
 
 void glue_restart_game_fiber(uint32_t resume_pc)
 {
-    if (!s_main_fiber)
-        return;
-    if (fiber_current() != s_main_fiber) {
-        fprintf(stderr, "glue: glue_restart_game_fiber called off the scheduler fiber\n");
-        abort();
-    }
+    glue_restart_game_fiber_ex(resume_pc, 0);
+}
 
-    s_game_running = 0;
-    s_game_yielded_vblank = 0;
-    s_native_pc_scope=s_native_instruction_open=s_native_vblank_completed=0;
+/* State-restore resume: keep the restored 68K A7 (the load path restored the
+ * full CPU state; the stale stack chain below A7 is the game's own boot
+ * chain and lets stack-sensitive code unwind back into the dispatcher). */
+void glue_restart_game_fiber_keep_a7(uint32_t resume_pc)
+{
+    glue_restart_game_fiber_ex(resume_pc, 1);
+}
+
+/* ---- shared scheduler-accounting reset ----------------------------------
+ * Fresh-tick values for every transient field the sched section carries.
+ * Used by both the fiber-restart path and the in-place state load. */
+static void glue_reset_sched_accounting(void)
+{
+    s_native_pc_scope = s_native_instruction_open = s_native_vblank_completed = 0;
 #if SONIC_REVERSE_DEBUG
     s_game_yielded_break = 0;
 #endif
@@ -1650,10 +1682,59 @@ void glue_restart_game_fiber(uint32_t resume_pc)
     s_vblank_executed_this_frame = 0;
     g_cycle_accumulator = 0;
     g_audio_cycle_counter = 0;
-    s_game_stack_top = 0;
-    s_game_stack_last_report = 0;
     g_rte_pending = 0;
     s_yield_site = GLUE_YIELD_NONE;
+    s_own_vint_latched = 0;
+    s_own_hint_latched = 0;
+    s_in_vblank_service = 0;
+    s_irq_in_progress = 0;
+    s_game_fiber_resume_pc = 0;
+}
+
+/* ---- in-place state load (portable file save/load) -----------------------
+ * The blob swap happens under the parked game fiber: registers + RAM + chips
+ * are replaced, the fiber is NOT reset, and the game continues from its
+ * vblank-wait park with the boot chain (tail frames) intact. */
+static uint8_t  s_keep_controller1 = 0;
+static uint8_t  s_keep_controller2 = 0;
+static uint32_t s_keep_stamp_rebase = 0;
+
+int glue_prepare_inplace_load(void)
+{
+    if (!s_main_fiber || !s_game_fiber) return 0;
+    s_keep_controller1 = g_controller1_buttons;
+    s_keep_controller2 = g_controller2_buttons;
+    s_keep_stamp_rebase = g_68k_stamp_rebase;
+    fprintf(stderr, "[LOAD] in-place: fiber parked, yield_site=%d\n",
+            (int)s_yield_site);
+    return 1;
+}
+
+void glue_finish_inplace_load(void)
+{
+    if (!s_main_fiber || !s_game_fiber) return;
+    g_controller1_buttons = s_keep_controller1;
+    g_controller2_buttons = s_keep_controller2;
+    g_68k_stamp_rebase = s_keep_stamp_rebase;
+    s_game_yielded_vblank = 1;   /* fiber stays parked at the vblank wait */
+    glue_reset_sched_accounting();
+}
+
+void glue_restart_game_fiber_ex(uint32_t resume_pc, int keep_a7)
+{
+    if (!s_main_fiber)
+        return;
+    if (fiber_current() != s_main_fiber) {
+        fprintf(stderr, "glue: glue_restart_game_fiber called off the scheduler fiber\n");
+        abort();
+    }
+
+    s_keep_a7_on_resume = keep_a7;
+    s_game_running = 0;
+    s_game_yielded_vblank = 0;
+    glue_reset_sched_accounting();
+    s_game_stack_top = 0;
+    s_game_stack_last_report = 0;
 
     /* Reset in place: same engine-owned stack mapping, so the fiber's stack
      * range never changes for the life of the process (fiber snapshots are
@@ -1738,6 +1819,10 @@ static inline void audio_detour_write(uint32_t byte_addr, uint8_t value)
 #define SPIN_YIELD_THRESHOLD 256
 static uint32_t s_spin_addr = 0;
 static int      s_spin_count = 0;
+
+uint32_t glue_spin_addr(void) { return s_spin_addr; }
+int      glue_spin_count(void) { return s_spin_count; }
+uint32_t glue_get_pc(void) { return g_cpu.PC & 0xFFFFFFu; }
 
 static inline void spin_check(uint32_t byte_addr, int is_write)
 {

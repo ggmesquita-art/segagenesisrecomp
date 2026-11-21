@@ -91,6 +91,7 @@ bool    input_script_take_save_state(char *out, size_t out_cap);
 bool    input_script_take_screenshot(char *out, size_t out_cap);
 bool    input_script_take_load_state(char *out, size_t out_cap);
 bool    input_script_take_restart_game(uint32_t *pc);
+bool    input_script_take_cold_reset(void);
 bool    input_script_take_ram_dump(char *out, size_t out_cap);
 bool    input_script_take_vram_dump(char *out, size_t out_cap);
 

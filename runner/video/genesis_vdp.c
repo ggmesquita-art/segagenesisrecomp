@@ -243,12 +243,20 @@ static void dma_run_68k_to_vdp(GVDP *v)
      * display (~16 in H32). 488 68K cycles per line. Without this charge the
      * V-int handler's big vblank DMAs (sprite table, hscroll, queued art)
      * consume zero raster time and the main loop resumes tens of lines
-     * earlier than hardware. */
+     * earlier than hardware.
+     *
+     * DETERMINISM NOTE: the blanked/active selection depends on the raster
+     * position AT THE COMMAND WRITE, which differs between the recompiled and
+     * interpreted backends (per-scanline chunk slicing) — a divergent stall
+     * charge then shifts the cycle budget and feeds back into the slicing
+     * (the menu/training black-screen divergence class). Both backends run
+     * the same VDP model, so charge the SAME deterministic rate regardless:
+     * the blanked rate, where the game's real DMAs (V-int handler, menu
+     * queue drain) live. The only cost is a slightly optimistic freeze for
+     * mid-active-line transfers, which the game's own raster waits absorb. */
     {
-        int blanked = v->in_vblank || !MODE2_DISPLAY_ON(v);
-        uint32_t slots = blanked ? (MODE4_H40(v) ? 205u : 166u)
-                                 : (MODE4_H40(v) ? 18u  : 16u);
-        uint32_t charge = (uint32_t)(((uint64_t)len * 488u) / slots);
+        (void)v;
+        uint32_t charge = (uint32_t)(((uint64_t)len * 488u) / 205u);
         s_pending_68k_stall += charge;
 #ifdef GEN_DEV_TRACE
         /* [DMA-STALL] any single 68K->VDP transfer charging more than ~half a
@@ -257,10 +265,10 @@ static void dma_run_68k_to_vdp(GVDP *v)
         if (charge > 60000u) {
             extern unsigned long g_snd_frame;
             fprintf(stderr, "[DMA-STALL] wf=%lu len=%u words src=%06X dst=%04X "
-                            "code=%X blanked=%d charge=%u (pending=%u)\n",
+                            "code=%X charge=%u (pending=%u)\n",
                     g_snd_frame, (unsigned)len, (unsigned)dma_source_68k(v),
                     (unsigned)v->address, (unsigned)(v->code & 0x0F),
-                    blanked, (unsigned)charge, (unsigned)s_pending_68k_stall);
+                    (unsigned)charge, (unsigned)s_pending_68k_stall);
         }
 #endif
     }
@@ -687,6 +695,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
     memset(drawn, 0, (size_t)total);
 
     int link = 0, on_line = 0, pixels_budget = total;
+    int any_nonzero_x = 0;   /* hardware: x==0 masks only after a sprite with x>0 */
 
     for (int n = 0; n < max_sprites; n++) {
         uint16_t e = (uint16_t)(sat + link * 8);
@@ -714,9 +723,14 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             int xword     = vram_read_word(v, (uint16_t)(e + 6)) & 0x3FF;
             int screen_x  = xword - 128 + offset;  /* +offset: center in the output canvas */
 
-            /* Sprite masking: an x==0 sprite after another on-line sprite
-             * masks the rest of the line. */
-            if (xword == 0 && on_line > 1) break;
+            /* Sprite masking (GPGX/hardware rule): an x==0 sprite masks the
+             * rest of the line only after a previous on-line sprite with
+             * x != 0. An x==0 sprite BEFORE any x!=0 sprite does not mask. */
+            if (xword == 0) {
+                if (any_nonzero_x) break;
+            } else {
+                any_nonzero_x = 1;
+            }
 
             int tile = attr & 0x07FF;
             int pal  = (attr >> 13) & 0x3;
@@ -724,6 +738,20 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             int hf   = (attr & 0x0800) != 0;
             int vf   = (attr & 0x1000) != 0;
             int width = hsz * 8;
+
+            /* Hardware dot budget: the sprite's FULL width counts (offscreen
+             * parts included). The sprite that crosses the remaining budget is
+             * TRUNCATED to it (cell granularity) and the line stops — GPGX
+             * render_obj_m5 semantics. */
+            int draw_cells = hsz;
+            if (!s_unlimited_sprites) {
+                if (pixels_budget <= 0) { v->sprite_overflow = 1; break; }
+                if (width > pixels_budget) {
+                    int cells = (pixels_budget + 7) >> 3;
+                    draw_cells = cells < hsz ? cells : hsz;
+                }
+                pixels_budget -= width;
+            }
 
             int iy = vf ? (height - 1 - (line - y)) : (line - y);
             int celly = iy >> cell_h_shift, fy = iy & ((1 << cell_h_shift) - 1);
@@ -736,7 +764,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             /* Resolve sprite cell/row addresses once per eight output pixels.
              * VRAM is stable during this scanline call; no persistent cache or
              * invalidation/state migration is involved. */
-            for (int cell = 0; cell < hsz; ++cell) {
+            for (int cell = 0; cell < draw_cells; ++cell) {
                 int cellx = hf ? hsz - 1 - cell : cell;
                 int tileno = (tile + cellx * vsz + celly) & 0x07ff;
                 unsigned pattern_address=(unsigned)tileno*tile_bytes+(unsigned)fy*4u;
@@ -782,7 +810,7 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             }
 #if !GENESIS_BATCHED_PLANES
             } else {
-            for (int lx = 0; lx < width; lx++) {
+            for (int lx = 0; lx < draw_cells * 8; lx++) {
                 int sx = screen_x + lx;
                 if (sx < 0 || sx >= total) continue;
                 int ix = hf ? (width - 1 - lx) : lx;
@@ -812,7 +840,9 @@ static void sprite_render_line(GVDP *v, int line, int total, int offset)
             }
 #endif
             }
-            pixels_budget -= width;
+            /* Budget already consumed above (before drawing); stop the line
+             * once it is exhausted, exactly as the hardware stops after the
+             * truncated crossing sprite (GPGX render_obj_m5). */
             if (pixels_budget <= 0 && !s_unlimited_sprites) { v->sprite_overflow = 1; break; }
         }
 
