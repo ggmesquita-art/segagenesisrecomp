@@ -55,6 +55,42 @@ const char *gvdp_plane_implementation(void)
 #include <stdio.h>   /* [DMA-STALL] rare-event dev print */
 #endif
 
+/* ---- env-gated VDP write/DMA trace (T2 diagnosis) -------------------------
+ * GENESIS_VDP_TRACE=FROM-TO  prints control/data/DMA/CRAM events for the wall
+ * frame window. Zero runtime cost when the env var is absent. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+static int      s_vdp_trace = -1;
+static uint32_t s_vdp_trace_from = 0, s_vdp_trace_to = UINT32_MAX;
+static void vdp_trace_init(void)
+{
+    const char *e = getenv("GENESIS_VDP_TRACE");
+    s_vdp_trace = 0;
+    if (e && *e) {
+        s_vdp_trace = 1;
+        unsigned a, b;
+        if (sscanf(e, "%u-%u", &a, &b) == 2) { s_vdp_trace_from = a; s_vdp_trace_to = b; }
+    }
+}
+static void vdp_trace_emit(const char *fmt, ...)
+{
+    extern unsigned long g_snd_frame;
+    if (s_vdp_trace && (uint32_t)g_snd_frame >= s_vdp_trace_from
+                   && (uint32_t)g_snd_frame <= s_vdp_trace_to) {
+        va_list ap;
+        va_start(ap, fmt);
+        fprintf(stderr, "[VDPT] ");
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+        fprintf(stderr, " [wf=%lu]\n", g_snd_frame);
+    }
+}
+#define VDP_TRACE(...) do {                                            \
+    if (s_vdp_trace < 0) vdp_trace_init();                             \
+    vdp_trace_emit(__VA_ARGS__);                                       \
+} while (0)
+
 /* ---- Register accessors (named for readability; all clean-room) ----------- */
 #define R(v, n)            ((v)->reg[(n)])
 #define REG_MODE1(v)       R(v, 0x00)
@@ -196,6 +232,7 @@ static void cram_write(GVDP *v, uint16_t addr, uint16_t value)
     unsigned idx = (addr >> 1) & (GVDP_CRAM_ENTRIES - 1);
     uint16_t bgr9 = value & 0x0EEE;     /* 3 bits each B,G,R                   */
     v->cram[idx] = bgr9;
+    VDP_TRACE("CRAM idx=%u val=%04X", idx, bgr9);
     if (v->colour_updated) v->colour_updated(v->colour_updated_user, idx, bgr9);
 }
 
@@ -236,6 +273,8 @@ static void dma_run_68k_to_vdp(GVDP *v)
 {
     uint32_t len = dma_length(v);
     uint32_t src = dma_source_68k(v);
+    VDP_TRACE("DMA68K code=%02X addr=%04X len=%u src=%06X",
+              v->code, v->address, len, src);
     if (!v->bus_read) return;
     /* Hardware freezes the 68K for the whole 68K->VDP transfer. Bandwidth is
      * raster-gated access slots: ~205 words/line with the display blanked
@@ -322,6 +361,9 @@ static void dma_run_vram_fill_data(GVDP *v, uint16_t value)
 
 static void maybe_start_dma(GVDP *v)
 {
+    VDP_TRACE("DMACHK code=%02X regs=%02X%02X%02X%02X%02X",
+              v->code, REG_DMA_LEN_LO(v), REG_DMA_LEN_HI(v),
+              REG_DMA_SRC_LO(v), REG_DMA_SRC_MID(v), REG_DMA_SRC_HI(v));
     if (!(v->code & CODE_DMA_BIT)) return;
     if (!MODE2_DMA_ON(v)) {
         evt_push(v, GVDP_EVT_DMA_SKIP, v->code, v->address, 0, REG_AUTOINC(v),
@@ -378,12 +420,14 @@ void gvdp_write_control(GVDP *v, uint16_t value)
         v->code = (uint8_t)((v->code & 0x03) | ((value >> 2) & 0x3C));
         v->control_pending = 0;
         evt_push(v, GVDP_EVT_CMD, v->code, v->address, value, REG_AUTOINC(v), 0, 0, 0);
+        VDP_TRACE("CMD code=%02X addr=%04X w=%04X", v->code, v->address, value);
         maybe_start_dma(v);
     }
 }
 
 void gvdp_write_data(GVDP *v, uint16_t value)
 {
+    VDP_TRACE("DATA code=%02X addr=%04X val=%04X", v->code, v->address, value);
     v->control_pending = 0;
     evt_push(v, GVDP_EVT_DATA, v->code, v->address, value, REG_AUTOINC(v), 0, 0,
              v->dma_fill_pending ? GVDP_SKIP_FILL_TRIGGER : 0);
