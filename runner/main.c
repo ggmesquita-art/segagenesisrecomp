@@ -3806,6 +3806,12 @@ session_begin:;
                     local_states_modal(renderer, texture, &running, turbo);
                     if (!running) { window_close_requested = 1; break; }
                     prev_overlay_pad = gamepad_overlay_mask();
+                    if (s_pending_load_path[0]) {
+                        char staged_path[512];
+                        snprintf(staged_path, sizeof(staged_path), "%s", s_pending_load_path);
+                        s_pending_load_path[0] = 0;
+                        runner_load_state_file(staged_path);
+                    }
                     continue;
                 }
             }

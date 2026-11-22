@@ -1664,47 +1664,34 @@ void glue_restart_game_fiber_keep_a7(uint32_t resume_pc)
 /* ---- shared scheduler-accounting reset ----------------------------------
  * Fresh-tick values for every transient field the sched section carries.
  * Used by both the fiber-restart path and the in-place state load. */
-static void glue_reset_sched_accounting(void)
-{
-    s_native_pc_scope = s_native_instruction_open = s_native_vblank_completed = 0;
-#if SONIC_REVERSE_DEBUG
-    s_game_yielded_break = 0;
-#endif
-    s_interleave_active = 0;
-    s_cycle_budget = 0;
-    s_main_cpu_divisor = 1;
-    s_main_cpu_clock.remainder = s_main_cpu_stalls = 0;
-    s_chunk_cycles = 0;
-    s_irq_cycle_debt = 0;
-    s_irq_cycle_debt_level = 0;
-    s_watchdog_counter = 0;
-    s_vblank_fired_this_frame = 0;
-    s_vblank_executed_this_frame = 0;
-    g_cycle_accumulator = 0;
-    g_audio_cycle_counter = 0;
-    g_rte_pending = 0;
-    s_yield_site = GLUE_YIELD_NONE;
-    s_own_vint_latched = 0;
-    s_own_hint_latched = 0;
-    s_in_vblank_service = 0;
-    s_irq_in_progress = 0;
-    s_game_fiber_resume_pc = 0;
-}
+static void glue_reset_sched_accounting(void);
 
 /* ---- in-place state load (portable file save/load) -----------------------
- * The blob swap happens under the parked game fiber: registers + RAM + chips
- * are replaced, the fiber is NOT reset, and the game continues from its
- * vblank-wait park with the boot chain (tail frames) intact. */
+ * Only safe when the game fiber is cleanly parked at GLUE_YIELD_VBLANK and
+ * the GameSpec does not provide a custom call_resume unwind handler. Games
+ * that yield via GLUE_YIELD_BUDGET / GLUE_YIELD_SPIN or mid-call-stack must
+ * take the cold fiber-restart path so host C call frames never mismatch the
+ * restored 68K RAM and stack. */
 static uint8_t  s_keep_controller1 = 0;
 static uint8_t  s_keep_controller2 = 0;
 static uint32_t s_keep_stamp_rebase = 0;
+static int      s_keep_live_valid = 0;
 
 int glue_prepare_inplace_load(void)
 {
-    if (!s_main_fiber || !s_game_fiber) return 0;
+    if (!s_main_fiber || !s_game_fiber) {
+        s_keep_live_valid = 0;
+        return 0;
+    }
     s_keep_controller1 = g_controller1_buttons;
     s_keep_controller2 = g_controller2_buttons;
     s_keep_stamp_rebase = g_68k_stamp_rebase;
+    s_keep_live_valid = 1;
+    if (s_yield_site != GLUE_YIELD_VBLANK || !s_game_yielded_vblank || g_game_spec.call_resume) {
+        fprintf(stderr, "[LOAD] fiber-restart: yield_site=%d vblank_parked=%d call_resume=%d\n",
+                (int)s_yield_site, s_game_yielded_vblank, g_game_spec.call_resume ? 1 : 0);
+        return 0;
+    }
     fprintf(stderr, "[LOAD] in-place: fiber parked, yield_site=%d\n",
             (int)s_yield_site);
     return 1;
@@ -1716,7 +1703,8 @@ void glue_finish_inplace_load(void)
     g_controller1_buttons = s_keep_controller1;
     g_controller2_buttons = s_keep_controller2;
     g_68k_stamp_rebase = s_keep_stamp_rebase;
-    s_game_yielded_vblank = 1;   /* fiber stays parked at the vblank wait */
+    s_keep_live_valid = 0;
+    s_game_yielded_vblank = (((g_cpu.SR >> 8) & 7u) < 6u) ? 1 : 0;
     glue_reset_sched_accounting();
 }
 
@@ -1733,6 +1721,12 @@ void glue_restart_game_fiber_ex(uint32_t resume_pc, int keep_a7)
     s_game_running = 0;
     s_game_yielded_vblank = 0;
     glue_reset_sched_accounting();
+    if (keep_a7 && s_keep_live_valid) {
+        g_controller1_buttons = s_keep_controller1;
+        g_controller2_buttons = s_keep_controller2;
+        g_68k_stamp_rebase = s_keep_stamp_rebase;
+        s_keep_live_valid = 0;
+    }
     s_game_stack_top = 0;
     s_game_stack_last_report = 0;
 
@@ -2649,6 +2643,44 @@ typedef struct GlueRbSched {
     int32_t  split_sp_popped;
     int32_t  native_pc_scope,native_instruction_open,native_vblank_completed;
 } GlueRbSched;
+
+static void glue_reset_sched_accounting(void)
+{
+    s_native_pc_scope = s_native_instruction_open = s_native_vblank_completed = 0;
+#if SONIC_REVERSE_DEBUG
+    s_game_yielded_break = 0;
+#endif
+    s_interleave_active = 0;
+    s_cycle_budget = 0;
+    s_main_cpu_divisor = 1;
+    s_main_cpu_clock.remainder = s_main_cpu_stalls = 0;
+    s_chunk_cycles = 0;
+    s_irq_cycle_debt = 0;
+    s_irq_cycle_debt_level = 0;
+    s_watchdog_counter = 0;
+    s_vblank_fired_this_frame = 0;
+    s_vblank_executed_this_frame = 0;
+    g_cycle_accumulator = 0;
+    g_audio_cycle_counter = 0;
+    s_rte_real = 0;
+    s_rte_dummy = 0;
+    g_rte_pending_ptr = &s_rte_real;
+    g_early_return = 0;
+    g_split_sp_popped = 0;
+    s_pending_irq = 0;
+    s_state_parked = 0;
+    s_spin_addr = 0;
+    s_spin_count = 0;
+    s_z80poll_last_addr = 0;
+    s_z80poll_streak = 0;
+    s_in_floor = 0;
+    s_yield_site = GLUE_YIELD_NONE;
+    s_own_vint_latched = 0;
+    s_own_hint_latched = 0;
+    s_in_vblank_service = 0;
+    s_irq_in_progress = 0;
+    s_game_fiber_resume_pc = 0;
+}
 
 size_t glue_rb_sched_save(void *dst, size_t cap)
 {
