@@ -48,4 +48,17 @@ typedef void (*AudioMixerExecutor)(AudioMixerJob,void *,AudioMixerJob,void *,voi
  * FM/PSG stay on the owner; join precedes verification/substitution. */
 void audio_mixer_set_shadow_executor(AudioMixerExecutor executor,void *context);
 
+/* Passive read-only observer invoked on the emulation thread after
+ * timestamp ordering and per-chip monotonic clamping for every applied
+ * YM2612 (ports 0..3) and PSG (port 4) register write in the frame.
+ *
+ * At the start of each audio_mixer_drain() frame (before any register events
+ * for that frame, even when n_apply == 0), the observer is called once with
+ * port == 0xFFu (value=0, cycle_stamp=0, frame_end_cycle) to signal a new
+ * drain frame boundary. */
+typedef void (*AudioChipWriteObserver)(uint8_t port, uint8_t value,
+                                       uint32_t cycle_stamp,
+                                       uint32_t frame_end_cycle);
+void audio_mixer_set_chip_observer(AudioChipWriteObserver observer);
+
 #endif

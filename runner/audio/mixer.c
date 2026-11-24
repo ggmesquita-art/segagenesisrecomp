@@ -96,6 +96,9 @@ static AudioMixerExecutor s_executor;
 static void *s_executor_context;
 void audio_mixer_set_shadow_executor(AudioMixerExecutor executor,void *context)
 {s_executor=executor;s_executor_context=context;}
+static AudioChipWriteObserver s_chip_observer = NULL;
+void audio_mixer_set_chip_observer(AudioChipWriteObserver observer)
+{s_chip_observer = observer;}
 static int mixer_outputs_disjoint(const int16_t *fm,size_t fm_cap,
                                   const int16_t *psg,size_t psg_cap)
 {
@@ -285,6 +288,19 @@ void audio_mixer_drain(uint32_t frame_end_cycle,
         if(psg.output && psg.written)
             filter_present(psg.output,s_audition_enabled?s_aud_psg_raw:raw_psg,psg.written,1,&s_psg_filter_mix,s_psg_filter_span,1);
         if((fm.output && fm.written) || (psg.output && psg.written))s_filter_started=1;
+        if (s_chip_observer) {
+            s_chip_observer(0xFFu, 0u, 0u, frame_end_cycle);
+            uint32_t obs_fm_prev = 0;
+            uint32_t obs_psg_prev = 0;
+            for (size_t i = 0; i < n_apply; i++) {
+                AudioEvent e = evs[i].e;
+                uint32_t *previous = (e.port == AUDIO_PORT_PSG) ? &obs_psg_prev : &obs_fm_prev;
+                if (e.cycle_stamp < *previous) e.cycle_stamp = *previous;
+                *previous = e.cycle_stamp;
+                if (e.port == AUDIO_PORT_PSG || e.port < 4u)
+                    s_chip_observer(e.port, e.value, e.cycle_stamp, frame_end_cycle);
+            }
+        }
         /* Diagnostics retain the original merged applied order and clamped
          * stamps. The owner logs only after both jobs really completed. */
         if(s_ad)for(size_t i=0;i<n_apply;i++){
@@ -299,6 +315,9 @@ void audio_mixer_drain(uint32_t frame_end_cycle,
         if(psg_written)*psg_written=psg.written;
         return;
     }
+    if (s_chip_observer) {
+        s_chip_observer(0xFFu, 0u, 0u, frame_end_cycle);
+    }
     for (size_t i = 0; i < n_apply; i++) {
         AudioEvent e = evs[i].e;
         if (e.port == AUDIO_PORT_PSG) {
@@ -306,6 +325,7 @@ void audio_mixer_drain(uint32_t frame_end_cycle,
             uint32_t delta = e.cycle_stamp - psg_prev;
             if (delta > 0) psg_advance(delta);
             psg_write(e.value);
+            if (s_chip_observer) s_chip_observer(AUDIO_PORT_PSG, e.value, e.cycle_stamp, frame_end_cycle);
             psg_prev = e.cycle_stamp;
         } else {
             /* FM ports 0..3 */
@@ -322,6 +342,7 @@ void audio_mixer_drain(uint32_t frame_end_cycle,
                 case AUDIO_PORT_FM2_DATA: ym2612_write(3, e.value); fm_shadow_write(3, e.value); break;
                 default: break;
             }
+            if (s_chip_observer && e.port < 4u) s_chip_observer(e.port, e.value, e.cycle_stamp, frame_end_cycle);
             fm_prev = e.cycle_stamp;
         }
         if (s_ad) {

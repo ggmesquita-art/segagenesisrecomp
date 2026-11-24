@@ -1648,6 +1648,10 @@ void glue_load_state(FILE *sf)
       latched=0; fread(&latched,1,1,sf); s_own_hint_latched=latched?1:0; }
 }
 
+/* Forward declaration: MSVC (C11) rejects calls before the definition without
+ * a prototype (implicit `int` return conflicts with the `void` definition). */
+void glue_restart_game_fiber_ex(uint32_t resume_pc, int keep_a7);
+
 void glue_restart_game_fiber(uint32_t resume_pc)
 {
     glue_restart_game_fiber_ex(resume_pc, 0);

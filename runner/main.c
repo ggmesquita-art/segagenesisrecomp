@@ -18,9 +18,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
-#endif
-#ifndef _WIN32
+#include <direct.h>
+#else
 #include <unistd.h>   /* readlink, ssize_t â€” exe-dir resolution + popen picker */
+#include <sys/stat.h>
 #ifdef __ANDROID__
 #include <dirent.h>   /* ROM scan of the app files dir (no file dialogs) */
 #include <strings.h>  /* strcasecmp */
@@ -1783,6 +1784,66 @@ int runner_write_screenshot_file(const char *path)
     return ok;
 }
 
+static int runner_capture_interactive_screenshot(SDL_Renderer *renderer)
+{
+    char dir_buf[512];
+    const char *dir = resolve_runner_path("screenshots", dir_buf, sizeof(dir_buf));
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0755);
+#endif
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char stamp[32];
+    if (tm_info) {
+        strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", tm_info);
+    } else {
+        snprintf(stamp, sizeof(stamp), "%llu", (unsigned long long)now);
+    }
+
+    char out_path[600];
+    snprintf(out_path, sizeof(out_path), "%s/ec_%s.png", dir, stamp);
+    for (int seq = 1; seq <= 99; ++seq) {
+        FILE *probe = fopen(out_path, "rb");
+        if (!probe)
+            break;
+        fclose(probe);
+        snprintf(out_path, sizeof(out_path), "%s/ec_%s_%02d.png", dir, stamp, seq);
+    }
+
+    if (renderer) {
+        int rw = 0, rh = 0;
+        if (SDL_GetRendererOutputSize(renderer, &rw, &rh) == 0 &&
+            rw > 0 && rh > 0 &&
+            (size_t)rw <= SIZE_MAX / (size_t)rh / sizeof(uint32_t)) {
+            uint32_t *pixels = (uint32_t *)malloc((size_t)rw * (size_t)rh * sizeof(uint32_t));
+            if (pixels) {
+                int rrc = SDL_RenderReadPixels(renderer, NULL,
+                                               SDL_PIXELFORMAT_ARGB8888,
+                                               pixels, rw * (int)sizeof(uint32_t));
+                if (rrc == 0 && png_write_argb(out_path, pixels, rw, rh, rw) == 0) {
+                    free(pixels);
+                    fprintf(stderr, "[SCREENSHOT] saved %s (%dx%d)\n", out_path, rw, rh);
+                    return 1;
+                }
+                free(pixels);
+            }
+        }
+    }
+
+    int ok = png_write_argb(out_path, s_framebuf,
+                            s_screen_width, s_screen_height,
+                            MAX_SCREEN_WIDTH) == 0;
+    if (ok)
+        fprintf(stderr, "[SCREENSHOT] saved %s (%dx%d)\n",
+                out_path, s_screen_width, s_screen_height);
+    else
+        fprintf(stderr, "[SCREENSHOT] failed to write %s\n", out_path);
+    return ok;
+}
+
 /* =========================================================================
  * Frame logging (main-loop version, works in ALL build modes)
  * ========================================================================= */
@@ -2542,6 +2603,45 @@ static void replay_view(GenesisReplayView *v,int apply)
     }
 }
 
+static void print_runner_usage(const char *prog_name)
+{
+    const char *name = (g_game_spec.display_name && *g_game_spec.display_name)
+                           ? g_game_spec.display_name
+                           : "Sega Genesis Recomp";
+    printf("%s (GenesisRecomp)\n\n", name);
+    printf("Uso:\n  %s [opcoes] [rom_path]\n\n", prog_name ? prog_name : "recomp");
+    printf("Opcoes do Runner:\n");
+    printf("  -h, --help                     Exibe esta mensagem de ajuda e encerra\n");
+    printf("  --widescreen <modo>            Modo widescreen: off, fit, stage ou W:H (ex: 16:9, 21:9, 32:9)\n");
+    printf("  --pacing <modo>                Modo de cadencia de quadros: sync, uncapped, fiber, accurate\n");
+    printf("  --interlace-display <modo>     Modo de desentrelacamento: auto, bob, weave\n");
+    printf("  --wav <path>                   Grava a saida de audio sintetizada em arquivo WAV\n");
+    printf("  --turbo                        Executa sem sincronizacao de tempo nem audio (taxa destravada)\n");
+    printf("  --launcher                     Forca a abertura do menu launcher grafico\n");
+    printf("  --no-launcher                  Inicia o jogo diretamente, sem exibir o launcher\n");
+    printf("  --max-frames <n>               Encerra a execucao apos n frames\n");
+    printf("  --benchmark <n>                Executa benchmark headless por n frames em modo turbo\n");
+    printf("  --measure-runtime <n>          Mede tempo real de execucao de n frames em velocidade nativa\n");
+    printf("  --runtime-uncapped             Usado com --measure-runtime para executar sem limitador de FPS\n");
+    printf("  --framelog <path>              Registra o tempo de cada frame em arquivo de log\n");
+    printf("  --input-script <path>          Executa script de entradas deterministicas gravadas\n");
+    printf("  --fresh-evidence               Descarta evidencias anteriores de misses de dispatch para nova sessao\n");
+    printf("  --port <n>                     Porta TCP para servidor de depuracao e controle remoto\n");
+    printf("  --target-fps <f>               Sobrescreve a taxa de quadros alvo (FPS)\n");
+    printf("  --yield-log                    Gera log detalhado de esperas por V-Blank (yield_log_native.log)\n");
+    printf("  --psg-vol-div <int>            Divisor de ganho de volume do canal PSG\n");
+    printf("  --snd-dump-frame <n>           Despeja buffers de audio no frame n especificado\n");
+    printf("  --snd-dump-vint <n>            Despeja buffers de audio no contador V-Int n especificado\n");
+    printf("  --hash-frames <n>              Calcula hash deterministico de video nos primeiros n frames\n");
+    printf("  --hash-on-mode                 Calcula hash deterministico em transicoes de modo de jogo\n");
+    printf("  --replay-diagnostic <path>     Carrega e reproduz arquivo de diagnostico de sessao\n");
+    printf("\n");
+    if (g_game_spec.arg_usage && *g_game_spec.arg_usage) {
+        printf("Opcoes Especificas do Jogo (%s):\n", name);
+        printf("  %s\n\n", g_game_spec.arg_usage);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     cmd_server_owner_review_init(getenv("GENESIS_OWNER_REVIEW"));
@@ -2639,7 +2739,10 @@ int main(int argc, char *argv[])
     }
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_runner_usage(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
             max_frames = (uint32_t)atol(argv[++i]);
         } else if (strcmp(argv[i], "--runtime-uncapped") == 0) {
             runtime_uncapped = 1;
@@ -3677,6 +3780,7 @@ session_begin:;
         }
 
         int overlay_request = 0;
+        int screenshot_requested = 0;
         SDL_Event ev;
         while (window_poll_event(&ev)) {
             if(ev.type==SDL_RENDER_TARGETS_RESET||ev.type==SDL_RENDER_DEVICE_RESET) {
@@ -3768,13 +3872,16 @@ session_begin:;
                         }
                     }
                 }
-                /* [SND-TRACE] F12 = dump the sound-command lifecycle ring AND
-                 * the [CHIP-TRACE] FM/PSG register-write stream, coincidentally
-                 * so the two snapshots line up for native-vs-oracle A/B. */
+                /* F12 = capture PNG screenshot into screenshots/.
+                 * Shift+F12 / Ctrl+F12 = [SND-TRACE] dump sound-command + FM/PSG rings. */
                 if (ev.key.keysym.sym == SDLK_F12) {
-                    /* chip_ring = shared stream (both builds); snd_ring = own only. */
-                    { extern void chip_trace_dump(const char *path); chip_trace_dump("chip_ring.txt"); }
-                    { extern void snd_trace_dump(const char *path); snd_trace_dump("snd_ring.txt"); }
+                    if ((ev.key.keysym.mod & (KMOD_SHIFT | KMOD_CTRL)) != 0) {
+                        /* chip_ring = shared stream (both builds); snd_ring = own only. */
+                        { extern void chip_trace_dump(const char *path); chip_trace_dump("chip_ring.txt"); }
+                        { extern void snd_trace_dump(const char *path); snd_trace_dump("snd_ring.txt"); }
+                    } else if (!ev.key.repeat) {
+                        screenshot_requested = 1;
+                    }
                 }
                 /* F10 = cold reset (fresh boot; battery SRAM survives). */
                 if (ev.key.keysym.sym == SDLK_F10 && !ev.key.repeat) {
@@ -4461,6 +4568,10 @@ session_begin:;
                 SDL_RenderClear(renderer);SDL_RenderCopy(renderer,texture,&src,NULL);
                 now=SDL_GetPerformanceCounter();
                 if(now<at)genesis_host_wait_until(at,perf_frequency);
+                if (screenshot_requested) {
+                    runner_capture_interactive_screenshot(renderer);
+                    screenshot_requested = 0;
+                }
                 draw_load_hold(renderer);
                 SDL_RenderPresent(renderer);
                 ++presentation_count;interpolation_count+=interpolated!=0;
@@ -4481,6 +4592,10 @@ session_begin:;
             Uint64 now=SDL_GetPerformanceCounter();
             if(!turbo && !runtime_uncapped && now<guest_deadline)
                 genesis_host_wait_until(guest_deadline,perf_frequency);
+            if (screenshot_requested) {
+                runner_capture_interactive_screenshot(renderer);
+                screenshot_requested = 0;
+            }
             draw_load_hold(renderer);
             SDL_RenderPresent(renderer);++presentation_count;
         }
