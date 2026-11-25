@@ -393,6 +393,19 @@ if(TARGET SDL2::SDL2)
     genesisrecomp_runner_target(input_combo_test)
     add_test(NAME input_combo COMMAND input_combo_test "${CMAKE_CURRENT_BINARY_DIR}/input-combo-test.ini")
 
+    add_executable(app_config_roundtrip_test runtime/app_config_roundtrip_test.c
+        "${CMAKE_CURRENT_LIST_DIR}/../runner/gamepad.c"
+        "${CMAKE_CURRENT_LIST_DIR}/../runner/input_map.c"
+        "${CMAKE_CURRENT_LIST_DIR}/../runner/app_config.c")
+    target_include_directories(app_config_roundtrip_test PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../runner"
+        "${CMAKE_CURRENT_LIST_DIR}/../runner/include"
+        "${CMAKE_CURRENT_LIST_DIR}/../runner/external/clowncommon"
+        ${SDL2_PARENT_INCLUDE_DIRS})
+    target_link_libraries(app_config_roundtrip_test PRIVATE SDL2::SDL2)
+    genesisrecomp_runner_target(app_config_roundtrip_test)
+    add_test(NAME app_config_roundtrip COMMAND app_config_roundtrip_test "${CMAKE_CURRENT_BINARY_DIR}/app-config-roundtrip.ini")
+
     add_executable(window_events_test runtime/window_events_test.c
         "${CMAKE_CURRENT_LIST_DIR}/../runner/fiber_compat.c")
     target_include_directories(window_events_test PRIVATE

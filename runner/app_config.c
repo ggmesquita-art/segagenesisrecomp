@@ -335,7 +335,9 @@ void app_config_reload_preserving_mods(const char *path)
     g_app_config.custom_widescreen=on;g_app_config.custom_aspect=aspect;
     g_app_config.replay_diagnostics=diagnostics;
 }
-int app_config_save(const char *path)
+/* Writes ONLY the runner-owned sections, fresh, to `path` (merge happens in
+ * app_config_save). */
+static int write_runner_ini(const char *path)
 {
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
@@ -370,6 +372,227 @@ int app_config_save(const char *path)
 
     int ok=!ferror(f);
     if(fclose(f)!=0)ok=0;
+    return ok;
+}
+
+/* ---- merge-preserving save ----------------------------------------------
+ * settings.ini is shared with the game (e.g. [ec.audio]) and the user's
+ * comments. Saving rewrites only runner-owned keys; every other section, line,
+ * comment and unknown key is kept verbatim. */
+typedef struct { char **v; int n, cap; } IniLines;
+typedef struct { char name[64]; IniLines l; } IniSec;   /* name "" = preamble */
+typedef struct { IniSec *s; int n, cap; } IniDoc;
+
+static void il_add(IniLines *l, const char *s, size_t len)
+{
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 16;
+        l->v = (char **)realloc(l->v, (size_t)l->cap * sizeof *l->v);
+    }
+    char *c = (char *)malloc(len + 1);
+    memcpy(c, s, len); c[len] = 0;
+    l->v[l->n++] = c;
+}
+
+static IniSec *doc_add(IniDoc *d, const char *name)
+{
+    if (d->n == d->cap) {
+        d->cap = d->cap ? d->cap * 2 : 16;
+        d->s = (IniSec *)realloc(d->s, (size_t)d->cap * sizeof *d->s);
+    }
+    IniSec *s = &d->s[d->n++];
+    memset(s, 0, sizeof *s);
+    snprintf(s->name, sizeof s->name, "%s", name);
+    return s;
+}
+
+static void doc_free(IniDoc *d)
+{
+    for (int i = 0; i < d->n; i++) {
+        for (int j = 0; j < d->s[i].l.n; j++) free(d->s[i].l.v[j]);
+        free(d->s[i].l.v);
+    }
+    free(d->s);
+    memset(d, 0, sizeof *d);
+}
+
+/* Section name of a header line ("[name]"), or 0. */
+static int header_name(const char *line, char *out, size_t n)
+{
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line != '[') return 0;
+    const char *e = strchr(line, ']');
+    if (!e) return 0;
+    size_t len = (size_t)(e - line - 1);
+    if (len >= n) len = n - 1;
+    memcpy(out, line + 1, len); out[len] = 0;
+    return 1;
+}
+
+static int doc_parse(IniDoc *d, const char *text, size_t len)
+{
+    doc_add(d, "");
+    IniSec *cur = &d->s[0];
+    size_t pos = 0;
+    while (pos < len) {
+        const char *nl = (const char *)memchr(text + pos, '\n', len - pos);
+        size_t end = nl ? (size_t)(nl - text) + 1 : len;
+        char one[1024], name[64];
+        size_t ll = end - pos;
+        if (ll >= sizeof one) ll = sizeof one - 1;   /* absurdly long lines are truncated */
+        memcpy(one, text + pos, ll); one[ll] = 0;
+        if (header_name(one, name, sizeof name)) cur = doc_add(d, name);
+        il_add(&cur->l, one, ll);
+        pos = end;
+    }
+    /* Keep verbatim whether the file ended with a newline: add one if absent. */
+    return 1;
+}
+
+/* Extracts key and value (trailing "; comment" and spaces removed). 0 if not a pair. */
+static int line_kv(const char *line, char *key, size_t kn, char *val, size_t vn)
+{
+    while (*line == ' ' || *line == '\t') line++;
+    if (!*line || *line == ';' || *line == '#' || *line == '[' || *line == '\r' || *line == '\n') return 0;
+    const char *eq = strchr(line, '=');
+    if (!eq) return 0;
+    size_t k = (size_t)(eq - line);
+    while (k && (line[k - 1] == ' ' || line[k - 1] == '\t')) k--;
+    if (k >= kn) k = kn - 1;
+    memcpy(key, line, k); key[k] = 0;
+    const char *v = eq + 1;
+    while (*v == ' ' || *v == '\t') v++;
+    size_t l = 0;
+    while (v[l] && v[l] != ';' && v[l] != '\r' && v[l] != '\n') l++;
+    while (l && (v[l - 1] == ' ' || v[l - 1] == '\t')) l--;
+    if (l >= vn) l = vn - 1;
+    memcpy(val, v, l); val[l] = 0;
+    return 1;
+}
+
+static int is_blank(const char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    return !*s;
+}
+
+static IniSec *doc_find(IniDoc *d, const char *name)
+{
+    for (int i = 1; i < d->n; i++) if (!strcmp(d->s[i].name, name)) return &d->s[i];
+    return NULL;
+}
+
+static char *slurp(const char *path, size_t *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)(sz > 0 ? sz : 0) + 1);
+    size_t got = sz > 0 ? fread(buf, 1, (size_t)sz, f) : 0;
+    fclose(f);
+    buf[got] = 0; *len = got;
+    return buf;
+}
+
+static void emit_line(FILE *f, const char *line)
+{
+    size_t l = strlen(line);
+    fwrite(line, 1, l, f);
+    if (!l || line[l - 1] != '\n') fputc('\n', f);
+}
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static int replace_file(const char *tmp, const char *dst)
+{ return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 1 : 0; }
+#else
+static int replace_file(const char *tmp, const char *dst) { return rename(tmp, dst) == 0; }
+#endif
+
+int app_config_save(const char *path)
+{
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    char gen[1100];
+    snprintf(gen, sizeof gen, "%s.gen", path);
+    if (!write_runner_ini(gen)) return 0;
+
+    size_t glen = 0, olen = 0;
+    char *gtext = slurp(gen, &glen);
+    char *otext = slurp(path, &olen);
+    remove(gen);
+    if (!gtext) { free(otext); return 0; }
+
+    IniDoc g = {0}, o = {0};
+    doc_parse(&g, gtext, glen);
+    if (otext) doc_parse(&o, otext, olen);
+    free(gtext); free(otext);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { doc_free(&g); doc_free(&o); return 0; }
+
+    /* Preamble: the user's if the file existed, else the runner's header. */
+    IniSec *pre = o.n ? &o.s[0] : &g.s[0];
+    for (int j = 0; j < pre->l.n; j++) emit_line(f, pre->l.v[j]);
+
+    unsigned char *used = (unsigned char *)calloc((size_t)(g.n + 1), 1);
+    for (int i = 1; i < o.n; i++) {
+        IniSec *os = &o.s[i];
+        IniSec *gs = doc_find(&g, os->name);
+        int gi = gs ? (int)(gs - g.s) : 0;
+        if (!gs || used[gi]) {   /* not ours (or duplicate section): verbatim */
+            for (int j = 0; j < os->l.n; j++) emit_line(f, os->l.v[j]);
+            continue;
+        }
+        used[gi] = 1;
+        int is_player = !strncmp(os->name, "input.p", 7);
+        unsigned char *seen = (unsigned char *)calloc((size_t)(gs->l.n + 1), 1);
+        /* Pass 1: decide which existing lines survive (and in what form). */
+        char **out = (char **)calloc((size_t)os->l.n + 1, sizeof *out);
+        int outn = 0;
+        for (int j = 0; j < os->l.n; j++) {
+            char k[96], v[256], gk[96], gv[256];
+            const char *line = os->l.v[j];
+            if (j == 0 || !line_kv(line, k, sizeof k, v, sizeof v)) { out[outn++] = (char *)line; continue; }
+            int match = -1;
+            for (int m = 1; m < gs->l.n; m++)
+                if (line_kv(gs->l.v[m], gk, sizeof gk, gv, sizeof gv) && !strcmp(gk, k)) { match = m; break; }
+            if (match >= 0) {
+                if (seen[match]) continue;          /* duplicate runner key: drop */
+                seen[match] = 1;
+                line_kv(gs->l.v[match], gk, sizeof gk, gv, sizeof gv);
+                out[outn++] = !strcmp(v, gv) ? (char *)line : gs->l.v[match];
+            } else if (is_player && (!strncmp(k, "combo.", 6) || !strncmp(k, "autofire.", 9))) {
+                continue;                           /* runner key no longer set */
+            } else out[outn++] = (char *)line;      /* unknown key / comment: keep */
+        }
+        /* Missing runner keys go after the last non-blank line of the section. */
+        int last = outn;
+        while (last > 1 && is_blank(out[last - 1])) last--;
+        for (int j = 0; j < last; j++) emit_line(f, out[j]);
+        for (int m = 1; m < gs->l.n; m++) {
+            char gk[96], gv[256];
+            if (!seen[m] && line_kv(gs->l.v[m], gk, sizeof gk, gv, sizeof gv)) emit_line(f, gs->l.v[m]);
+        }
+        for (int j = last; j < outn; j++) emit_line(f, out[j]);
+        free(out); free(seen);
+    }
+    /* Runner sections absent from the existing file go at the end. */
+    for (int i = 1; i < g.n; i++) {
+        if (used[i]) continue;
+        if (o.n > 1) fputc('\n', f);
+        for (int j = 0; j < g.s[i].l.n; j++) emit_line(f, g.s[i].l.v[j]);
+    }
+    free(used);
+    doc_free(&g); doc_free(&o);
+
+    int ok = !ferror(f);
+    if (fclose(f) != 0) ok = 0;
+    if (ok) ok = replace_file(tmp, path);
+    if (!ok) remove(tmp);
     return ok;
 }
 
