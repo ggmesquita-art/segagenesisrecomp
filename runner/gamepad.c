@@ -109,7 +109,8 @@ void gamepad_handle_event(const SDL_Event *ev)
         case SDL_CONTROLLERBUTTONDOWN:
             /* Quicksave / quickload taps from player 1's shoulders — only when
              * P1 is a 3-button pad (6-button uses LB/RB for Y/Z). */
-            if (s_pad[0] && ev->cbutton.which == s_pad_jid[0] &&
+            if (g_input_map.pad_hotkeys &&
+                s_pad[0] && ev->cbutton.which == s_pad_jid[0] &&
                 g_input_map.p[0].pad_type != PAD_6BUTTON) {
                 if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER)
                     s_pending_save = 1;
@@ -172,6 +173,12 @@ uint16_t gamepad_player_mask(int player)
     return m;
 }
 
+int gamepad_player_bind_held(int player, const GamepadBind *bind)
+{
+    if (player < 0 || player >= INPUT_MAX_PLAYERS || !bind) return 0;
+    return bind_held(s_pad[player], bind, player_deadzone(player));
+}
+
 int gamepad_player_connected(int player)
 {
     return player >= 0 && player < INPUT_MAX_PLAYERS && s_pad[player] &&
@@ -181,7 +188,8 @@ int gamepad_player_connected(int player)
 int gamepad_turbo_held(void)
 {
     /* Player 1's Back/View button, 3-button mode only (6-button uses it for Mode). */
-    if (!s_pad[0] || g_input_map.p[0].pad_type == PAD_6BUTTON) return 0;
+    if (!g_input_map.pad_hotkeys || !s_pad[0] ||
+        g_input_map.p[0].pad_type == PAD_6BUTTON) return 0;
     return SDL_GameControllerGetButton(s_pad[0], SDL_CONTROLLER_BUTTON_BACK);
 }
 
@@ -223,7 +231,7 @@ int gamepad_consume_quickload(void)
 
 int gamepad_quickload_held(void)
 {
-    return gamepad_player_connected(0) &&
+    return g_input_map.pad_hotkeys && gamepad_player_connected(0) &&
         g_input_map.p[0].pad_type != PAD_6BUTTON &&
         !SDL_GameControllerGetButton(s_pad[0], SDL_CONTROLLER_BUTTON_BACK) &&
         SDL_GameControllerGetButton(s_pad[0], SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);

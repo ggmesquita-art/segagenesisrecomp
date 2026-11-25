@@ -29,6 +29,7 @@
 
 #include <stdint.h>
 #include "clowncommon.h"
+#include "input_map.h"   /* GamepadBind */
 #include "backend_decls.h"   /* own decls — native builds have no clownmdemu paths */
 
 union SDL_Event;
@@ -46,6 +47,9 @@ void gamepad_handle_event(const SDL_Event *ev);
  * controller is assigned to that player. */
 uint16_t gamepad_player_mask(int player);
 int gamepad_player_connected(int player);
+/* Whether a pad bind (button, or axis beyond the player's deadzone) is held on
+ * that player's controller. 0 when no controller is assigned. */
+int gamepad_player_bind_held(int player, const GamepadBind *bind);
 
 int     gamepad_turbo_held(void);
 int     gamepad_consume_quicksave(void);

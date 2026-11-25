@@ -2624,6 +2624,7 @@ static void print_runner_usage(const char *prog_name)
     printf("  --measure-runtime <n>          Mede tempo real de execucao de n frames em velocidade nativa\n");
     printf("  --runtime-uncapped             Usado com --measure-runtime para executar sem limitador de FPS\n");
     printf("  --framelog <path>              Registra o tempo de cada frame em arquivo de log\n");
+    printf("  --load-slot <1..9>             Carrega o quickstate do slot N apos o boot (como F1..F9)\n");
     printf("  --input-script <path>          Executa script de entradas deterministicas gravadas\n");
     printf("  --fresh-evidence               Descarta evidencias anteriores de misses de dispatch para nova sessao\n");
     printf("  --port <n>                     Porta TCP para servidor de depuracao e controle remoto\n");
@@ -2720,6 +2721,7 @@ int main(int argc, char *argv[])
      * for the format spec. Combined with --max-frames + --hash-frames,
      * makes the runner a one-shot regression-test driver. */
     const char *input_script_path = NULL;
+    int load_slot_cli = 0;   /* --load-slot N (1..9) */
 
     /* Pacing mode override: --pacing fiber|accurate or --pacing=...
      * NULL = not set via CLI (debug.ini may still override; otherwise
@@ -2812,6 +2814,12 @@ int main(int argc, char *argv[])
             hash_frames = (uint32_t)atol(argv[++i]);
         } else if (strcmp(argv[i], "--hash-on-mode") == 0) {
             hash_on_mode = 1;
+        } else if (strcmp(argv[i], "--load-slot") == 0 && i + 1 < argc) {
+            load_slot_cli = atoi(argv[++i]);
+            if (load_slot_cli < 1 || load_slot_cli > 9) {
+                fprintf(stderr, "[LOAD] --load-slot expects 1..9 (got %s); ignored\n", argv[i]);
+                load_slot_cli = 0;
+            }
         } else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc) {
             input_script_path = argv[++i];
         } else if (strcmp(argv[i], "--exec-coverage-out") == 0 && i + 1 < argc) {
@@ -3705,6 +3713,16 @@ session_begin:;
                                    g_app_config.rewind_depth,
                                    g_app_config.rewind_interval);
     audio_set_playback_enabled(!turbo && !cmd_server_is_paused());
+    if (load_slot_cli) {
+        /* Same safe path as the F1..F9 hold: staged, applied at the post-frame point. */
+        char slot_name[48], full_path[512];
+        snprintf(slot_name, sizeof slot_name, "native_save_%d.bin", load_slot_cli);
+        const char *resolved = resolve_runner_path(slot_name, full_path, sizeof full_path);
+        FILE *probe = fopen(resolved, "rb");
+        if (!probe) fprintf(stderr, "[LOAD] --load-slot %d: %s not found; continuing without load\n", load_slot_cli, resolved);
+        else { fclose(probe); runner_stage_load_state(slot_name); }
+        load_slot_cli = 0;
+    }
     uint32_t frame_num = 0;
     HostTiming host_timing = {0};
     const Uint64 host_perf_freq = SDL_GetPerformanceFrequency();
@@ -3893,7 +3911,7 @@ session_begin:;
 
         if (!running) break; /* Close must not execute another game/render tick. */
         {
-            uint32_t pad = gamepad_overlay_mask();
+            uint32_t pad = g_input_map.pad_hotkeys ? gamepad_overlay_mask() : 0;
             uint32_t menu = GP_OVERLAY_BACK | GP_OVERLAY_RB;
             uint32_t rewind = GP_OVERLAY_BACK | GP_OVERLAY_R3;
             if ((pad & rewind) == rewind && (prev_overlay_pad & rewind) != rewind)
@@ -4051,6 +4069,7 @@ session_begin:;
          * DoCycles switches to game fiber for each scanline's worth of
          * cycles. Game code and VDP rendering interleave naturally. */
         s_current_frame_for_input = frame_num;
+        input_map_set_frame(frame_num);
         {
           GenesisSimInput sim_in;
 #if GENESIS_HAS_RECOMP_NET
@@ -4214,6 +4233,7 @@ session_begin:;
             for (int ef = 0; ef < cmd_cr.run_extra_frames; ef++) {
                 frame_num++;
                 s_current_frame_for_input = frame_num;
+                input_map_set_frame(frame_num);
                 memset(s_fm_accum,  0, sizeof(s_fm_accum));
                 memset(s_psg_accum, 0, sizeof(s_psg_accum));
                 s_fm_count = 0; s_psg_count = 0;

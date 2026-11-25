@@ -92,6 +92,92 @@ static void format_pad_bind(const GamepadBind *b, char *out, size_t n)
         snprintf(out, n, "none");
 }
 
+static const struct { const char *name; GenesisButton b; } k_combo_dest_names[] = {
+    {"up",GB_UP},{"down",GB_DOWN},{"left",GB_LEFT},{"right",GB_RIGHT},
+    {"a",GB_A},{"b",GB_B},{"c",GB_C},{"start",GB_START},
+    {"x",GB_X},{"y",GB_Y},{"z",GB_Z},{"mode",GB_MODE},
+};
+
+static int ieq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+static GenesisButton button_by_name_ci(const char *name)
+{
+    for (int b = 0; b < GB_COUNT; b++)
+        if (ieq(name, input_button_name((GenesisButton)b))) return (GenesisButton)b;
+    return GB_COUNT;
+}
+
+/* Parse "<origin> -> a+b+c" (tolerant of spaces, trailing "; comment").
+ * Returns 1 and fills *out, or 0 when invalid. */
+static int parse_combo(const char *val, InputCombo *out)
+{
+    char buf[160];
+    snprintf(buf, sizeof buf, "%s", val);
+    char *semi = strchr(buf, ';'); if (semi) *semi = '\0';
+    char *arrow = strstr(buf, "->");
+    if (!arrow) return 0;
+    *arrow = '\0';
+    char *src = trim(buf), *dst = trim(arrow + 2);
+    InputCombo c; memset(&c, 0, sizeof c);
+    char o[64]; size_t n = 0;
+    for (const char *p = src; *p && n + 1 < sizeof o; p++) if (*p != ' ' && *p != '\t') o[n++] = *p;
+    o[n] = '\0';
+    char *end;
+    if (!strncmp(o, "pad:button:", 11)) {
+        long v = strtol(o + 11, &end, 10);
+        if (end == o + 11 || *end || v < 0 || v > 64) return 0;
+        c.kind = COMBO_SRC_PAD_BUTTON; c.code = (int)v;
+    } else if (!strncmp(o, "pad:axis:", 9)) {
+        long v = strtol(o + 9, &end, 10);
+        if (end == o + 9 || v < 0 || v > 16 || *end != ':' || (end[1] != '+' && end[1] != '-') || end[2]) return 0;
+        c.kind = COMBO_SRC_PAD_AXIS; c.code = (int)v; c.axis_dir = end[1] == '-' ? -1 : 1;
+    } else if (!strncmp(o, "key:", 4)) {
+        long v = strtol(o + 4, &end, 10);
+        if (end == o + 4 || *end || v <= 0 || v > 511) return 0;
+        c.kind = COMBO_SRC_KEY; c.code = (int)v;
+    } else return 0;
+    char *tok = dst;
+    while (tok && *tok) {
+        char *plus = strchr(tok, '+');
+        if (plus) *plus = '\0';
+        char *t = trim(tok);
+        int found = 0;
+        for (unsigned i = 0; i < sizeof k_combo_dest_names / sizeof k_combo_dest_names[0]; i++)
+            if (ieq(t, k_combo_dest_names[i].name)) {
+                c.dest |= input_button_bit(k_combo_dest_names[i].b); found = 1; break;
+            }
+        if (!found) return 0;
+        tok = plus ? plus + 1 : NULL;
+    }
+    if (!c.dest) return 0;
+    *out = c;
+    return 1;
+}
+
+static void format_combo(const InputCombo *c, char *out, size_t n)
+{
+    char src[48], dst[64] = "";
+    if (c->kind == COMBO_SRC_PAD_BUTTON) snprintf(src, sizeof src, "pad:button:%d", c->code);
+    else if (c->kind == COMBO_SRC_PAD_AXIS)
+        snprintf(src, sizeof src, "pad:axis:%d:%c", c->code, c->axis_dir < 0 ? '-' : '+');
+    else snprintf(src, sizeof src, "key:%d", c->code);
+    for (unsigned i = 0; i < sizeof k_combo_dest_names / sizeof k_combo_dest_names[0]; i++)
+        if (c->dest & input_button_bit(k_combo_dest_names[i].b)) {
+            size_t l = strlen(dst);
+            snprintf(dst + l, sizeof dst - l, "%s%s", l ? "+" : "", k_combo_dest_names[i].name);
+        }
+    snprintf(out, n, "%s -> %s", src, dst);
+}
+
 /* ---- load ---------------------------------------------------------------- */
 
 int app_config_load(const char *path)
@@ -117,6 +203,7 @@ int app_config_load(const char *path)
             else if (!strcmp(name, "mods.widescreen")) section = 3;
             else if (!strcmp(name, "rewind"))   section = 4;
             else if (!strcmp(name, "mods.diagnostics")) section = 5;
+            else if (!strcmp(name, "input")) section = 20;
             else if (!strcmp(name, "input.p1")) section = 10;
             else if (!strcmp(name, "input.p2")) section = 11;
             else if (!strcmp(name, "input.p3")) section = 12;
@@ -124,6 +211,12 @@ int app_config_load(const char *path)
             else if (!strcmp(name, "input.p5")) section = 14;
             else if (!strcmp(name, "input.p6")) section = 15;
             else section = -1;
+            if (section >= 10 && section < 10 + INPUT_MAX_PLAYERS) {
+                /* The file is authoritative for combos/autofire of this player. */
+                PlayerInput *pp = &g_input_map.p[section - 10];
+                memset(pp->combo, 0, sizeof pp->combo);
+                memset(pp->autofire_hz, 0, sizeof pp->autofire_hz);
+            }
             continue;
         }
 
@@ -173,6 +266,8 @@ int app_config_load(const char *path)
             else if (!strcmp(key, "interval")) g_app_config.rewind_interval = atoi(val);
         } else if (section == 5) {
             if (!strcmp(key,"enabled")) g_app_config.replay_diagnostics=atoi(val)!=0;
+        } else if (section == 20) {
+            if (!strcmp(key, "pad_hotkeys")) g_input_map.pad_hotkeys = atoi(val) != 0;
         } else if (section >= 10 && section < 10 + INPUT_MAX_PLAYERS) {
             PlayerInput *pi = &g_input_map.p[section - 10];
             if      (!strcmp(key, "device"))   pi->device       = atoi(val);
@@ -184,6 +279,18 @@ int app_config_load(const char *path)
             } else if (!strncmp(key, "pad.", 4)) {
                 GenesisButton b = button_by_name(key + 4);
                 if (b < GB_COUNT) parse_pad_bind(val, &pi->pad[b]);
+            } else if (!strncmp(key, "combo.", 6)) {
+                char *e; long k = strtol(key + 6, &e, 10);
+                InputCombo c;
+                if (*e || k < 1 || k > INPUT_MAX_COMBOS || !parse_combo(val, &c))
+                    fprintf(stderr, "[input] ignoring invalid %s = %s (p%d)\n", key, val, section - 9);
+                else pi->combo[k - 1] = c;
+            } else if (!strncmp(key, "autofire.", 9)) {
+                GenesisButton b = button_by_name_ci(key + 9);
+                int hz = atoi(val);
+                if (b >= GB_COUNT || hz < 0 || hz > 60)
+                    fprintf(stderr, "[input] ignoring invalid %s = %s (p%d)\n", key, val, section - 9);
+                else pi->autofire_hz[b] = hz;
             }
         }
     }
@@ -207,6 +314,15 @@ static void write_player(FILE *f, int player)
         format_pad_bind(&pi->pad[b], buf, sizeof(buf));
         fprintf(f, "pad.%s = %s\n", input_button_name((GenesisButton)b), buf);
     }
+    for (int k = 0; k < INPUT_MAX_COMBOS; k++) {
+        if (pi->combo[k].kind == COMBO_SRC_NONE || !pi->combo[k].dest) continue;
+        char buf[160];
+        format_combo(&pi->combo[k], buf, sizeof buf);
+        fprintf(f, "combo.%d = %s\n", k + 1, buf);
+    }
+    for (int b = 0; b < GB_COUNT; b++)
+        if (pi->autofire_hz[b] > 0)
+            fprintf(f, "autofire.%s = %d\n", input_button_name((GenesisButton)b), pi->autofire_hz[b]);
     fprintf(f, "\n");
 }
 
@@ -248,6 +364,8 @@ int app_config_save(const char *path)
             g_app_config.custom_widescreen, app_config_aspect_mode(g_app_config.custom_aspect));
     fprintf(f,"[mods.diagnostics]\nenabled = %d\n\n",g_app_config.replay_diagnostics);
 
+    fprintf(f, "[input]\npad_hotkeys = %d   ; 0 frees pad LB/RB/Back from quicksave/quickload/turbo/overlay\n\n",
+            g_input_map.pad_hotkeys ? 1 : 0);
     for (int p = 0; p < INPUT_MAX_PLAYERS; ++p) write_player(f, p);
 
     int ok=!ferror(f);

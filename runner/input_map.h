@@ -52,18 +52,37 @@ typedef struct GamepadBind {
     int axis_dir;   /* -1 / +1 for GP_BIND_AXIS, else 0 */
 } GamepadBind;
 
+/* A combo: one physical origin -> several Genesis buttons (OR with normal binds). */
+typedef enum ComboSrcKind {
+    COMBO_SRC_NONE = 0, COMBO_SRC_PAD_BUTTON = 1, COMBO_SRC_PAD_AXIS = 2, COMBO_SRC_KEY = 3
+} ComboSrcKind;
+
+typedef struct InputCombo {
+    int      kind;      /* ComboSrcKind */
+    int      code;      /* SDL button / axis / scancode */
+    int      axis_dir;  /* -1 / +1 for COMBO_SRC_PAD_AXIS */
+    uint16_t dest;      /* OR of input_button_bit() */
+} InputCombo;
+
+enum { INPUT_MAX_COMBOS = 8 };
+
 typedef struct PlayerInput {
     int         device;            /* InputDevice */
     int         pad_type;          /* PadType */
     int         deadzone_pct;      /* 0..100 (stick analog deadzone) */
     int         key[GB_COUNT];     /* SDL_Scancode per button (0 = unbound) */
     GamepadBind pad[GB_COUNT];     /* gamepad binding per button */
+    InputCombo  combo[INPUT_MAX_COMBOS];   /* ini: combo.1..8 */
+    int         autofire_hz[GB_COUNT];     /* ini: autofire.<btn>; 0 = off */
 } PlayerInput;
 
 enum { INPUT_MAX_PLAYERS = 6 };
 typedef struct InputMap {
     /* Host logical players; the Genesis bus still exposes two physical ports. */
     PlayerInput p[INPUT_MAX_PLAYERS];
+    /* [input] pad_hotkeys: 1 (default) = pad LB/RB/Back fire quicksave/quickload/
+     * turbo/overlay; 0 = those pad buttons are free for binds/combos. */
+    int pad_hotkeys;
 } InputMap;
 
 /* The single live instance the runner + launcher read/write. */
@@ -82,6 +101,17 @@ uint16_t input_map_key_mask(int player);
  * keyboard (input_map_key_mask) and that player's gamepad (gamepad_player_mask).
  * This is what gets pushed to machine_set_pad() / queried by input_requested_cb. */
 uint16_t input_current_mask(int player);
+
+/* Pure combo + autofire resolution (deterministic, no SDL access).
+ * `mask`   = GPAD_* mask from the normal binds.
+ * `active` = bit K set when combo[K] origin is held.
+ * `frame`  = host frame counter (60 Hz game ticks); autofire is frame-based.
+ * Returns mask | dest of every active combo, then autofire gates each held
+ * button with hz > 0 (half period = max(1, round(30/hz)) frames, phase = frame). */
+uint16_t input_map_apply_combos(const PlayerInput *pi, uint16_t mask,
+                                unsigned active, uint32_t frame);
+/* Frame counter feeding autofire; main loop sets it once per game tick. */
+void input_map_set_frame(uint32_t frame);
 
 /* Host UI capture suppresses gameplay reads without clearing physical held
  * state. Keep UI navigation on its own event/raw-device path. */

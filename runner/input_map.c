@@ -44,6 +44,7 @@ static void set_btn(PlayerInput *pi, GenesisButton b, int scancode, int pad_butt
 void input_map_init_defaults(void)
 {
     memset(&g_input_map, 0, sizeof(g_input_map));
+    g_input_map.pad_hotkeys = 1;
     s_gameplay_blocked = 0;
 
     PlayerInput *p1 = &g_input_map.p[0];
@@ -116,6 +117,45 @@ uint16_t input_map_key_mask(int player)
     return m;
 }
 
+static uint32_t s_frame;
+void input_map_set_frame(uint32_t frame) { s_frame = frame; }
+
+uint16_t input_map_apply_combos(const PlayerInput *pi, uint16_t mask,
+                                unsigned active, uint32_t frame)
+{
+    for (int k = 0; k < INPUT_MAX_COMBOS; k++)
+        if ((active >> k) & 1u) mask |= pi->combo[k].dest;
+    for (int b = 0; b < GB_COUNT; b++) {
+        int hz = pi->autofire_hz[b];
+        if (hz <= 0 || !(mask & k_btn_bit[b])) continue;
+        uint32_t half = (uint32_t)((30 + hz / 2) / hz);   /* 60 Hz ticks per half period */
+        if (half < 1) half = 1;
+        if ((frame / half) & 1u) mask &= (uint16_t)~k_btn_bit[b];
+    }
+    return mask;
+}
+
+static unsigned combos_active(int player, const PlayerInput *pi)
+{
+    unsigned active = 0;
+    const Uint8 *ks = SDL_GetKeyboardState(NULL);
+    for (int k = 0; k < INPUT_MAX_COMBOS; k++) {
+        const InputCombo *c = &pi->combo[k];
+        int held = 0;
+        if (c->kind == COMBO_SRC_KEY) {
+            held = (pi->device & INPUT_DEV_KEYBOARD) && ks && c->code > 0 &&
+                   c->code < SDL_NUM_SCANCODES && ks[c->code];
+        } else if (c->kind == COMBO_SRC_PAD_BUTTON || c->kind == COMBO_SRC_PAD_AXIS) {
+            GamepadBind b;
+            b.kind = c->kind == COMBO_SRC_PAD_BUTTON ? GP_BIND_BUTTON : GP_BIND_AXIS;
+            b.code = c->code; b.axis_dir = c->axis_dir;
+            held = (pi->device & INPUT_DEV_GAMEPAD) && gamepad_player_bind_held(player, &b);
+        }
+        if (held) active |= 1u << k;
+    }
+    return active;
+}
+
 uint16_t input_current_mask(int player)
 {
     if (s_gameplay_blocked) return 0;
@@ -124,7 +164,7 @@ uint16_t input_current_mask(int player)
     uint16_t m = 0;
     if (pi->device & INPUT_DEV_KEYBOARD) m |= input_map_key_mask(player);
     if (pi->device & INPUT_DEV_GAMEPAD)  m |= gamepad_player_mask(player);
-    return m;
+    return input_map_apply_combos(pi, m, combos_active(player, pi), s_frame);
 }
 
 cc_bool input_player_enabled(int player)
