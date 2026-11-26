@@ -15,6 +15,7 @@
 #include "chip_trace.h"   /* [CHIP-TRACE] shared FM/PSG stream ring + g_snd_* globals */
 #include <string.h>
 #include <stdio.h>   /* [SND-TRACE] temporary sound-command lifecycle trace */
+#include <stdlib.h>  /* getenv (EC_PAD_DIAG) */
 
 GenesisMachine g_machine;
 
